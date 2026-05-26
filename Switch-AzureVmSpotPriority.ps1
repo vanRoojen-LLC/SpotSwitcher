@@ -24,18 +24,18 @@ mutating Azure resources. Execute mode requires an exact confirmation unless
 -Force is supplied for unattended automation.
 
 .EXAMPLE
-./Convert-AzureVmToSpot.ps1
+./Switch-AzureVmSpotPriority.ps1
 
 Run the full interactive wizard in plan-only mode by default.
 
 .EXAMPLE
-./Convert-AzureVmToSpot.ps1 -Mode Execute -ResourceGroupName SOUTHCENTRAL-CORE.RG -VmName DC-SouthCentral
+./Switch-AzureVmSpotPriority.ps1 -Mode Execute -ResourceGroupName SOUTHCENTRAL-CORE.RG -VmName DC-SouthCentral
 
 Discover the VM, infer the direction, prompt for missing choices, preview the
 commands, then require exact confirmation before executing.
 
 .EXAMPLE
-./Convert-AzureVmToSpot.ps1 -Mode Execute -NonInteractive -Force `
+./Switch-AzureVmSpotPriority.ps1 -Mode Execute -NonInteractive -Force `
   -Subscription azse-ga-sub `
   -ResourceGroupName SOUTHCENTRAL-CORE.RG `
   -VmName DC-SouthCentral `
@@ -93,13 +93,13 @@ function Show-Usage {
 SpotSwitcher - Azure VM Regular <-> Spot conversion wizard
 
 Interactive:
-  ./Convert-AzureVmToSpot.ps1
+  ./Switch-AzureVmSpotPriority.ps1
 
 Interactive execution:
-  ./Convert-AzureVmToSpot.ps1 -Mode Execute
+  ./Switch-AzureVmSpotPriority.ps1 -Mode Execute
 
 Unattended execution:
-  ./Convert-AzureVmToSpot.ps1 -Mode Execute -NonInteractive -Force `
+  ./Switch-AzureVmSpotPriority.ps1 -Mode Execute -NonInteractive -Force `
     -Subscription <sub> -ResourceGroupName <rg> -VmName <vm> `
     -Direction ToSpot -TargetSku <sku> -EvictionPolicy Deallocate -MaxPrice -1 `
     -PinPrivateIps Yes -CreateSnapshots Yes -ValidateSku No `
