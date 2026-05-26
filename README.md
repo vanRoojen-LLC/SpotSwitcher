@@ -42,3 +42,8 @@ Run unattended with explicit parameters:
 
 The script writes plan files to `~/clouddrive/SpotSwitcherPlans` in Cloud Shell
 when Cloud Drive is mounted, otherwise to `./SpotSwitcherPlans`.
+
+Azure Spot VMs cannot be created in availability sets. If a source VM is in an
+availability set, SpotSwitcher prompts before intentionally dropping that
+membership for a Spot conversion. In unattended mode, pass
+`-DropAvailabilitySetForSpot Yes` to make that choice explicit.

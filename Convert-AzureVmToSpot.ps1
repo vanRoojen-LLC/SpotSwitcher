@@ -77,6 +77,9 @@ param(
     [ValidateSet('Auto', 'Yes', 'No')]
     [string]$ValidateSku = 'Auto',
 
+    [ValidateSet('Auto', 'Yes', 'No')]
+    [string]$DropAvailabilitySetForSpot = 'Auto',
+
     [string]$PlanPath,
     [switch]$NonInteractive,
     [switch]$Force,
@@ -99,7 +102,8 @@ Unattended execution:
   ./Convert-AzureVmToSpot.ps1 -Mode Execute -NonInteractive -Force `
     -Subscription <sub> -ResourceGroupName <rg> -VmName <vm> `
     -Direction ToSpot -TargetSku <sku> -EvictionPolicy Deallocate -MaxPrice -1 `
-    -PinPrivateIps Yes -CreateSnapshots Yes -ValidateSku No
+    -PinPrivateIps Yes -CreateSnapshots Yes -ValidateSku No `
+    -DropAvailabilitySetForSpot No
 
 Direction is based on the source VM:
   Regular/null priority -> ToSpot
@@ -110,6 +114,9 @@ Safety defaults:
   - Execute mode sets OS disk, data disks, and NIC deleteOption to Detach.
   - Dynamic private IPs can be pinned to static before wrapper deletion.
   - Incremental snapshots can be created after deallocation.
+  - Availability-set membership is preserved for regular VMs, but must be
+    intentionally dropped when converting to Spot because Azure does not support
+    Spot VMs in availability sets.
   - Execute mode requires exact typed confirmation unless -Force is supplied.
 '@
 }
@@ -338,6 +345,59 @@ function Get-ResourceGroupFromId {
     return $null
 }
 
+function Test-SameResourceId {
+    param(
+        [string]$Left,
+        [string]$Right
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Left) -or [string]::IsNullOrWhiteSpace($Right)) {
+        return $false
+    }
+
+    $normalizedLeft = $Left.TrimEnd([char]'/')
+    $normalizedRight = $Right.TrimEnd([char]'/')
+    return [string]::Equals($normalizedLeft, $normalizedRight, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-PrimaryNicId {
+    param($Vm)
+
+    $nicRefs = @($Vm.networkProfile.networkInterfaces)
+    foreach ($nicRef in $nicRefs) {
+        if ($nicRef.primary -eq $true -or [string]$nicRef.primary -eq 'True') {
+            return [string]$nicRef.id
+        }
+    }
+
+    if ($nicRefs.Count -gt 0) {
+        return [string]$nicRefs[0].id
+    }
+
+    return $null
+}
+
+function Get-NicIdsInPrimaryOrder {
+    param($Vm)
+
+    $nicRefs = @($Vm.networkProfile.networkInterfaces)
+    $primaryNicId = Get-PrimaryNicId -Vm $Vm
+    $orderedNicIds = @()
+
+    if ($primaryNicId) {
+        $orderedNicIds += $primaryNicId
+    }
+
+    foreach ($nicRef in $nicRefs) {
+        $nicId = [string]$nicRef.id
+        if (-not (Test-SameResourceId -Left $nicId -Right $primaryNicId)) {
+            $orderedNicIds += $nicId
+        }
+    }
+
+    return $orderedNicIds
+}
+
 function Get-PlanRoot {
     $cloudDrive = Join-Path $HOME 'clouddrive'
     if (Test-Path $cloudDrive) {
@@ -555,6 +615,8 @@ function Show-InventorySummary {
     $vm = $Inventory.vm
     $priority = Get-EffectivePriority -Vm $vm
     $power = (@($Inventory.instanceView.instanceView.statuses) | Where-Object { $_.code -like 'PowerState/*' } | Select-Object -First 1).displayStatus
+    $availabilitySetId = if ($vm.availabilitySet -and $vm.availabilitySet.id) { $vm.availabilitySet.id } else { '<none>' }
+    $primaryNicId = Get-PrimaryNicId -Vm $vm
 
     Write-Section 'VM summary'
     Write-Host ("Name:        {0}" -f $vm.name)
@@ -569,10 +631,15 @@ function Show-InventorySummary {
     Write-Host ("NIC count:   {0}" -f @($Inventory.nics).Count)
     Write-Host ("Data disks:  {0}" -f @($vm.storageProfile.dataDisks).Count)
     Write-Host ("Extensions:  {0}" -f @($Inventory.extensions).Count)
+    Write-Host ("Avail. set:  {0}" -f $availabilitySetId)
+    if ($primaryNicId) {
+        Write-Host ("Primary NIC: {0}" -f $primaryNicId)
+    }
 
     foreach ($nic in @($Inventory.nics)) {
+        $primaryMarker = if (Test-SameResourceId -Left $nic.id -Right $primaryNicId) { 'primary' } else { 'secondary' }
         foreach ($ipConfig in @($nic.ipConfigurations)) {
-            Write-Host ("NIC:         {0} / {1} / {2} ({3})" -f $nic.name, $ipConfig.name, $ipConfig.privateIPAddress, $ipConfig.privateIPAllocationMethod)
+            Write-Host ("NIC:         {0} / {1} / {2} ({3}, {4})" -f $nic.name, $ipConfig.name, $ipConfig.privateIPAddress, $ipConfig.privateIPAllocationMethod, $primaryMarker)
         }
     }
 
@@ -840,6 +907,64 @@ function Resolve-YesNo {
         )
 }
 
+function Resolve-AvailabilitySetAction {
+    param(
+        $Vm,
+        [string]$ResolvedDirection
+    )
+
+    $availabilitySetId = $null
+    if ($Vm.availabilitySet -and $Vm.availabilitySet.id) {
+        $availabilitySetId = [string]$Vm.availabilitySet.id
+    }
+
+    if (-not $availabilitySetId) {
+        return 'None'
+    }
+
+    if ($ResolvedDirection -ne 'ToSpot') {
+        return 'Preserve'
+    }
+
+    Write-WarningLine "Source VM is in an availability set: $availabilitySetId"
+    Write-WarningLine 'Azure Spot VMs cannot be created in availability sets.'
+
+    if ($DropAvailabilitySetForSpot -eq 'Yes') {
+        Write-WarningLine 'The recreated Spot VM will intentionally omit availability-set membership.'
+        return 'DropForSpot'
+    }
+
+    if ($DropAvailabilitySetForSpot -eq 'No') {
+        Write-Fail 'Cannot convert this VM to Spot while preserving availability-set membership.'
+    }
+
+    if ($NonInteractive) {
+        Write-Fail 'Source VM is in an availability set. Rerun with -DropAvailabilitySetForSpot Yes to intentionally omit availability-set membership, or choose a VM outside an availability set.'
+    }
+
+    $dropAvailabilitySet = Read-MenuChoice `
+        -Title 'Availability set handling' `
+        -Default 2 `
+        -Options @(
+            [pscustomobject]@{
+                Label       = 'Recreate without availability set'
+                Description = 'Required if this VM must become Spot; availability-set membership will be intentionally dropped.'
+                Value       = $true
+            },
+            [pscustomobject]@{
+                Label       = 'Stop without building commands'
+                Description = 'Keep the VM in its availability set and leave Azure unchanged.'
+                Value       = $false
+            }
+        )
+
+    if ($dropAvailabilitySet -eq $true) {
+        return 'DropForSpot'
+    }
+
+    Write-Fail 'Stopped because Spot VMs cannot preserve availability-set membership.'
+}
+
 function Select-Decisions {
     param(
         $Inventory,
@@ -847,6 +972,7 @@ function Select-Decisions {
     )
 
     $vm = $Inventory.vm
+    $availabilitySetAction = Resolve-AvailabilitySetAction -Vm $vm -ResolvedDirection $ResolvedDirection
     $targetSkuValue = Select-TargetSku -Vm $vm -ResolvedDirection $ResolvedDirection
     if (Resolve-SkuValidation) {
         Test-TargetSku -Location $vm.location -Size $targetSkuValue -ResolvedDirection $ResolvedDirection
@@ -935,6 +1061,7 @@ function Select-Decisions {
         pinPrivateIps    = [bool]$pinPrivateIpsValue
         createSnapshots  = [bool]$createSnapshotsValue
         dynamicIpConfigs = $dynamicIpConfigs
+        availabilitySetAction = $availabilitySetAction
     }
 }
 
@@ -1008,8 +1135,8 @@ function Get-CreateVmArgs {
         '--nics'
     )
 
-    foreach ($nic in @($Plan.source.nics)) {
-        $args += $nic.id
+    foreach ($nicId in @(Get-NicIdsInPrimaryOrder -Vm $vm)) {
+        $args += $nicId
     }
 
     $args += @('--nic-delete-option', 'Detach')
@@ -1030,7 +1157,7 @@ function Get-CreateVmArgs {
         $args += @($vm.zones)
     }
 
-    if ($vm.availabilitySet -and $vm.availabilitySet.id) {
+    if ($vm.availabilitySet -and $vm.availabilitySet.id -and $decisions.availabilitySetAction -eq 'Preserve') {
         $args += @('--availability-set', $vm.availabilitySet.id)
     }
 
@@ -1151,6 +1278,8 @@ function Get-PostCreateCommands {
 
     $commands = @()
     $vm = $Plan.source.vm
+    $nicIds = @(Get-NicIdsInPrimaryOrder -Vm $vm)
+    $primaryNicId = Get-PrimaryNicId -Vm $vm
 
     foreach ($disk in @($vm.storageProfile.dataDisks | Sort-Object lun)) {
         $args = @(
@@ -1184,6 +1313,17 @@ function Get-PostCreateCommands {
                 '-n', $vm.name,
                 '--set'
             ) + $setExpressions)
+    }
+
+    if ($primaryNicId -and $nicIds.Count -gt 1) {
+        $commands += New-AzCommand -Description 'Restore primary NIC selection.' -Arguments (@(
+                'vm', 'nic', 'set',
+                '-g', $vm.resourceGroup,
+                '--vm-name', $vm.name,
+                '--nics'
+            ) + $nicIds + @(
+                '--primary-nic', $primaryNicId
+            ))
     }
 
     if ($vm.identity -and $vm.identity.type) {
@@ -1288,6 +1428,12 @@ function Show-DecisionSummary {
         Write-Host ("Eviction policy:  {0}" -f $Plan.decisions.evictionPolicy)
         Write-Host ("Max price:        {0}" -f $Plan.decisions.maxPrice)
     }
+    $availabilitySetSummary = switch ($Plan.decisions.availabilitySetAction) {
+        'Preserve' { 'Preserve original membership'; break }
+        'DropForSpot' { 'Drop because Spot VMs cannot use availability sets'; break }
+        default { 'None' }
+    }
+    Write-Host ("Availability set: {0}" -f $availabilitySetSummary)
     Write-Host ("Pin private IPs:  {0}" -f $Plan.decisions.pinPrivateIps)
     Write-Host ("Snapshots:        {0}" -f $Plan.decisions.createSnapshots)
 }
@@ -1339,7 +1485,7 @@ function Invoke-Main {
         'vm', 'show',
         '-g', $plan.source.vm.resourceGroup,
         '-n', $plan.source.vm.name,
-        '--query', '{priority:priority,evictionPolicy:evictionPolicy,vmSize:hardwareProfile.vmSize,osDisk:storageProfile.osDisk.managedDisk.id,nics:networkProfile.networkInterfaces[].id,tags:tags}',
+        '--query', '{priority:priority,evictionPolicy:evictionPolicy,vmSize:hardwareProfile.vmSize,availabilitySet:availabilitySet.id,osDisk:storageProfile.osDisk.managedDisk.id,nics:networkProfile.networkInterfaces[].{id:id,primary:primary},tags:tags}',
         '-o', 'json'
     ) -Description 'Reading recreated VM summary.'
 
