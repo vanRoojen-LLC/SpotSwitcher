@@ -11,7 +11,7 @@ and the choices needed for the correct direction:
 
 Default mode is read-only plan generation.
 
-Once this repository is public, run the latest version directly in Azure Cloud Shell PowerShell:
+Run the latest version directly in Azure Cloud Shell PowerShell:
 
 ```powershell
 iwr https://raw.githubusercontent.com/vanRoojen-LLC/SpotSwitcher/main/Switch-AzureVmSpotPriority.ps1 -OutFile ./Switch-AzureVmSpotPriority.ps1; ./Switch-AzureVmSpotPriority.ps1
