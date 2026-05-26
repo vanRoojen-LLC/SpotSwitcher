@@ -356,6 +356,16 @@ function Get-ResourceGroupFromId {
     return $null
 }
 
+function Get-SubscriptionIdFromId {
+    param([string]$Id)
+
+    if ($Id -match '/subscriptions/([^/]+)/') {
+        return $Matches[1]
+    }
+
+    return $null
+}
+
 function Test-SameResourceId {
     param(
         [string]$Left,
@@ -484,6 +494,15 @@ function Get-QuotaText {
     if ($Usage.name -and $Usage.name.localizedValue) {
         $parts += [string]$Usage.name.localizedValue
     }
+    if ($Usage.properties -and $Usage.properties.name -and $Usage.properties.name.value) {
+        $parts += [string]$Usage.properties.name.value
+    }
+    if ($Usage.properties -and $Usage.properties.name -and $Usage.properties.name.localizedValue) {
+        $parts += [string]$Usage.properties.name.localizedValue
+    }
+    if ($Usage.resourceName) {
+        $parts += [string]$Usage.resourceName
+    }
 
     return ($parts -join ' ')
 }
@@ -498,6 +517,200 @@ function Get-NormalizedQuotaText {
     return ($Text.ToLowerInvariant() -replace '[^a-z0-9]', '')
 }
 
+function Get-FirstObjectValue {
+    param(
+        $Object,
+        [string[]]$Paths
+    )
+
+    foreach ($path in $Paths) {
+        $current = $Object
+        $found = $true
+        foreach ($part in ($path -split '\.')) {
+            if ($null -eq $current) {
+                $found = $false
+                break
+            }
+
+            $property = $current.PSObject.Properties[$part]
+            if ($null -eq $property) {
+                $found = $false
+                break
+            }
+
+            $current = $property.Value
+        }
+
+        if ($found -and $null -ne $current) {
+            return $current
+        }
+    }
+
+    return $null
+}
+
+function Expand-ResultItems {
+    param($Result)
+
+    $items = @()
+    foreach ($item in @($Result)) {
+        $valueProperty = $item.PSObject.Properties['value']
+        if ($valueProperty -and $null -ne $valueProperty.Value -and $valueProperty.Value -isnot [string]) {
+            $items += @($valueProperty.Value)
+        }
+        else {
+            $items += $item
+        }
+    }
+
+    return $items
+}
+
+function Get-QuotaResourceName {
+    param($Item)
+
+    $value = Get-FirstObjectValue -Object $Item -Paths @(
+        'name.value',
+        'properties.name.value',
+        'resourceName',
+        'name'
+    )
+
+    if ($null -eq $value) {
+        return $null
+    }
+
+    return [string]$value
+}
+
+function Get-QuotaLocalizedName {
+    param($Item)
+
+    $value = Get-FirstObjectValue -Object $Item -Paths @(
+        'name.localizedValue',
+        'properties.name.localizedValue',
+        'localizedName',
+        'displayName'
+    )
+
+    if ($null -eq $value) {
+        return $null
+    }
+
+    return [string]$value
+}
+
+function Get-QuotaCurrentValue {
+    param($Item)
+
+    return ConvertTo-IntOrNull -Value (Get-FirstObjectValue -Object $Item -Paths @(
+            'currentValue',
+            'properties.currentValue',
+            'properties.usage.value',
+            'properties.usages.value',
+            'usage.value',
+            'usages.value'
+        ))
+}
+
+function Get-QuotaLimitValue {
+    param($Item)
+
+    return ConvertTo-IntOrNull -Value (Get-FirstObjectValue -Object $Item -Paths @(
+            'limit',
+            'properties.limit.value',
+            'properties.limit',
+            'limit.value'
+        ))
+}
+
+function New-QuotaUsageRecord {
+    param(
+        [string]$Name,
+        [string]$LocalizedName,
+        [int]$CurrentValue,
+        [int]$Limit,
+        [string]$Source
+    )
+
+    [pscustomobject]@{
+        name         = [pscustomobject]@{
+            value          = $Name
+            localizedValue = $LocalizedName
+        }
+        currentValue = $CurrentValue
+        limit        = $Limit
+        source       = $Source
+    }
+}
+
+function Convert-QuotaExtensionUsage {
+    param(
+        $UsageResult,
+        $LimitResult
+    )
+
+    $usageItems = @(Expand-ResultItems -Result $UsageResult)
+    $limitItems = @(Expand-ResultItems -Result $LimitResult)
+    $limitsByName = @{}
+
+    foreach ($limitItem in $limitItems) {
+        $name = Get-QuotaResourceName -Item $limitItem
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            continue
+        }
+
+        $limitsByName[(Get-NormalizedQuotaText -Text $name)] = $limitItem
+    }
+
+    $records = @()
+    foreach ($usageItem in $usageItems) {
+        $name = Get-QuotaResourceName -Item $usageItem
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            continue
+        }
+
+        $normalizedName = Get-NormalizedQuotaText -Text $name
+        $limitItem = $limitsByName[$normalizedName]
+        $currentValue = Get-QuotaCurrentValue -Item $usageItem
+        $limitValue = Get-QuotaLimitValue -Item $usageItem
+        if ($null -eq $limitValue -and $limitItem) {
+            $limitValue = Get-QuotaLimitValue -Item $limitItem
+        }
+
+        if ($null -eq $currentValue -or $null -eq $limitValue) {
+            continue
+        }
+
+        $localizedName = Get-QuotaLocalizedName -Item $usageItem
+        if ([string]::IsNullOrWhiteSpace($localizedName) -and $limitItem) {
+            $localizedName = Get-QuotaLocalizedName -Item $limitItem
+        }
+
+        $records += New-QuotaUsageRecord -Name $name -LocalizedName $localizedName -CurrentValue $currentValue -Limit $limitValue -Source 'QuotaApi'
+    }
+
+    return $records
+}
+
+function Convert-ComputeUsage {
+    param($UsageResult)
+
+    $records = @()
+    foreach ($usageItem in @(Expand-ResultItems -Result $UsageResult)) {
+        $name = Get-QuotaResourceName -Item $usageItem
+        $currentValue = Get-QuotaCurrentValue -Item $usageItem
+        $limitValue = Get-QuotaLimitValue -Item $usageItem
+        if ([string]::IsNullOrWhiteSpace($name) -or $null -eq $currentValue -or $null -eq $limitValue) {
+            continue
+        }
+
+        $records += New-QuotaUsageRecord -Name $name -LocalizedName (Get-QuotaLocalizedName -Item $usageItem) -CurrentValue $currentValue -Limit $limitValue -Source 'ComputeUsageApi'
+    }
+
+    return $records
+}
+
 function Find-QuotaUsage {
     param(
         [object[]]$Usages,
@@ -509,7 +722,7 @@ function Find-QuotaUsage {
     $normalizedFamily = Get-NormalizedQuotaText -Text $Family
     foreach ($usage in @($Usages)) {
         $normalized = Get-NormalizedQuotaText -Text (Get-QuotaText -Usage $usage)
-        if ($normalized -notmatch 'vcpu') {
+        if ($normalized -notmatch 'vcpu|cores') {
             continue
         }
 
@@ -560,12 +773,46 @@ function Get-RemainingQuota {
 }
 
 function Get-QuotaUsage {
-    param([string]$Location)
+    param(
+        [string]$Location,
+        [string]$SubscriptionId
+    )
 
     Write-Info "Reading regional quota usage for $Location."
-    Write-WarningLine 'Quota lookup is read-only but can take 10-30 seconds in Cloud Shell.'
+    Write-WarningLine 'Quota lookup is read-only but can take 10-30 seconds in Cloud Shell. The first run may install the Azure CLI quota extension.'
+    $records = @()
+
+    if ($SubscriptionId) {
+        $scope = "/subscriptions/$SubscriptionId/providers/Microsoft.Compute/locations/$Location"
+        try {
+            $usageResult = Invoke-AzJson -Arguments @('quota', 'usage', 'list', '--scope', $scope, '-o', 'json')
+            $limitResult = Invoke-AzJson -Arguments @('quota', 'list', '--scope', $scope, '-o', 'json')
+            $records = @(Convert-QuotaExtensionUsage -UsageResult $usageResult -LimitResult $limitResult)
+            if ($records.Count -gt 0) {
+                Write-Info "Quota API returned $($records.Count) compute quota rows."
+                return $records
+            }
+
+            Write-WarningLine 'Quota API returned no parseable compute quota rows; falling back to legacy compute usage.'
+        }
+        catch {
+            Write-WarningLine "Quota API lookup failed; falling back to legacy compute usage. $($_.Exception.Message)"
+        }
+    }
+    else {
+        Write-WarningLine 'Could not infer subscription id from the VM resource id; falling back to legacy compute usage.'
+    }
+
     try {
-        return @(Invoke-AzJson -Arguments @('vm', 'list-usage', '--location', $Location, '-o', 'json'))
+        $legacyUsage = Invoke-AzJson -Arguments @('vm', 'list-usage', '--location', $Location, '-o', 'json')
+        $records = @(Convert-ComputeUsage -UsageResult $legacyUsage)
+        if ($records.Count -gt 0) {
+            Write-WarningLine 'Legacy compute usage usually reports regional/family vCPU quota but may not expose Spot quota.'
+            return $records
+        }
+
+        Write-WarningLine 'Legacy compute usage returned no parseable quota rows.'
+        return @()
     }
     catch {
         Write-WarningLine "Quota lookup failed; SKU options will remain visible with quota marked unknown. $($_.Exception.Message)"
@@ -788,6 +1035,7 @@ function Get-QuotaEligibleSkus {
         }
 
         $quota = Test-SkuQuota -Sku $sku -Usages $Usages -ResolvedDirection $ResolvedDirection -SourceSku $SourceSku -SourceVm $SourceVm
+        $quotaConfidence = if ($quota.Unknown) { 1 } else { 0 }
         if (-not $quota.Allowed) {
             $blockedCount++
             continue
@@ -801,6 +1049,7 @@ function Get-QuotaEligibleSkus {
             name             = $sku.name
             sku              = $sku
             quotaDescription = $quota.Description
+            quotaConfidence  = $quotaConfidence
             score            = Get-SkuSimilarityScore -Sku $sku -SourceSku $SourceSku
         }
     }
@@ -813,7 +1062,7 @@ function Get-QuotaEligibleSkus {
         Write-WarningLine "Kept $unknownCount SKU option(s) visible because quota could not be matched confidently."
     }
 
-    return @($eligible | Sort-Object score, name)
+    return @($eligible | Sort-Object quotaConfidence, score, name)
 }
 
 function Select-PagedSku {
@@ -1183,7 +1432,7 @@ function Select-TargetSku {
     }
 
     $allSkus = @(Get-SkuCatalog -Location $Vm.location)
-    $quotaUsages = @(Get-QuotaUsage -Location $Vm.location)
+    $quotaUsages = @(Get-QuotaUsage -Location $Vm.location -SubscriptionId (Get-SubscriptionIdFromId -Id $Vm.id))
     $sourceSku = @($allSkus | Where-Object { $_.name -eq $currentSize } | Select-Object -First 1)
     if ($sourceSku.Count -eq 0) {
         Write-WarningLine "Could not find source SKU '$currentSize' in the regional SKU catalog. Similarity ranking and quota checks may be less precise."

@@ -16,7 +16,8 @@ subscription-wide VM list call.
 When converting to Spot, the SKU picker only offers the current VM size if it
 is Spot-capable and appears to fit available quota. Otherwise it recommends the
 closest unrestricted, quota-eligible Spot size. Browse results are shown five at
-a time.
+a time. Quota filtering uses the Azure CLI `quota` extension when available,
+then falls back to legacy compute usage, which may not expose Spot quota.
 
 Run the latest version directly in Azure Cloud Shell PowerShell:
 
