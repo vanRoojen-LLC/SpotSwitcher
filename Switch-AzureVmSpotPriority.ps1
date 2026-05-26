@@ -282,6 +282,17 @@ function Read-MenuChoice {
         return $Options[$Default - 1].Value
     }
 
+    function Complete-Choice {
+        param($Option)
+
+        Write-Info ("Selected: {0}" -f $Option.Label)
+        if ($Option.WaitDescription) {
+            Write-WarningLine $Option.WaitDescription
+        }
+
+        return $Option.Value
+    }
+
     Write-Section $Title
     for ($i = 0; $i -lt $Options.Count; $i++) {
         $number = $i + 1
@@ -300,12 +311,12 @@ function Read-MenuChoice {
     while ($true) {
         $answer = Read-Host "Choose 1-$($Options.Count)"
         if ([string]::IsNullOrWhiteSpace($answer)) {
-            return $Options[$Default - 1].Value
+            return (Complete-Choice -Option $Options[$Default - 1])
         }
 
         $parsed = 0
         if ([int]::TryParse($answer, [ref]$parsed) -and $parsed -ge 1 -and $parsed -le $Options.Count) {
-            return $Options[$parsed - 1].Value
+            return (Complete-Choice -Option $Options[$parsed - 1])
         }
 
         Write-WarningLine "Enter a number from 1 to $($Options.Count), or press Enter for the default."
@@ -424,6 +435,21 @@ function Get-TagsAsArguments {
     return $tagArgs
 }
 
+function ConvertTo-IntOrNull {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    $parsed = 0
+    if ([int]::TryParse(([string]$Value), [ref]$parsed)) {
+        return $parsed
+    }
+
+    return $null
+}
+
 function Get-EffectivePriority {
     param($Vm)
 
@@ -432,6 +458,409 @@ function Get-EffectivePriority {
     }
 
     return 'Regular'
+}
+
+function Get-SkuCapabilityValue {
+    param(
+        $Sku,
+        [string]$Name
+    )
+
+    $capability = @($Sku.capabilities | Where-Object { $_.name -eq $Name } | Select-Object -First 1)
+    if ($capability.Count -gt 0) {
+        return $capability[0].value
+    }
+
+    return $null
+}
+
+function Get-QuotaText {
+    param($Usage)
+
+    $parts = @()
+    if ($Usage.name -and $Usage.name.value) {
+        $parts += [string]$Usage.name.value
+    }
+    if ($Usage.name -and $Usage.name.localizedValue) {
+        $parts += [string]$Usage.name.localizedValue
+    }
+
+    return ($parts -join ' ')
+}
+
+function Get-NormalizedQuotaText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ''
+    }
+
+    return ($Text.ToLowerInvariant() -replace '[^a-z0-9]', '')
+}
+
+function Find-QuotaUsage {
+    param(
+        [object[]]$Usages,
+        [string]$Family,
+        [switch]$Regional,
+        [switch]$Spot
+    )
+
+    $normalizedFamily = Get-NormalizedQuotaText -Text $Family
+    foreach ($usage in @($Usages)) {
+        $normalized = Get-NormalizedQuotaText -Text (Get-QuotaText -Usage $usage)
+        if ($normalized -notmatch 'vcpu') {
+            continue
+        }
+
+        if ($Spot -and $normalized -notmatch 'spot') {
+            continue
+        }
+
+        if (-not $Spot -and $normalized -match 'spot') {
+            continue
+        }
+
+        if ($Regional) {
+            if ($normalized -match 'totalregional' -or ($normalized -match 'regional' -and $normalized -match 'total')) {
+                return $usage
+            }
+            continue
+        }
+
+        if ($normalizedFamily -and $normalized -like "*$normalizedFamily*") {
+            return $usage
+        }
+    }
+
+    return $null
+}
+
+function Get-RemainingQuota {
+    param(
+        $Usage,
+        [int]$Credit = 0
+    )
+
+    if ($null -eq $Usage) {
+        return $null
+    }
+
+    $limit = ConvertTo-IntOrNull -Value $Usage.limit
+    $current = ConvertTo-IntOrNull -Value $Usage.currentValue
+    if ($null -eq $limit -or $null -eq $current) {
+        return $null
+    }
+
+    if ($limit -lt 0) {
+        return [int]::MaxValue
+    }
+
+    return [math]::Max(0, ($limit - $current + $Credit))
+}
+
+function Get-QuotaUsage {
+    param([string]$Location)
+
+    Write-Info "Reading regional quota usage for $Location."
+    Write-WarningLine 'Quota lookup is read-only but can take 10-30 seconds in Cloud Shell.'
+    try {
+        return @(Invoke-AzJson -Arguments @('vm', 'list-usage', '--location', $Location, '-o', 'json'))
+    }
+    catch {
+        Write-WarningLine "Quota lookup failed; SKU options will remain visible with quota marked unknown. $($_.Exception.Message)"
+        return @()
+    }
+}
+
+function Test-SkuQuota {
+    param(
+        $Sku,
+        [object[]]$Usages,
+        [string]$ResolvedDirection,
+        $SourceSku,
+        $SourceVm
+    )
+
+    $vcpus = ConvertTo-IntOrNull -Value (Get-SkuCapabilityValue -Sku $Sku -Name 'vCPUs')
+    $family = [string](Get-SkuCapabilityValue -Sku $Sku -Name 'Family')
+    $sourceVcpus = ConvertTo-IntOrNull -Value (Get-SkuCapabilityValue -Sku $SourceSku -Name 'vCPUs')
+    $sourceFamily = [string](Get-SkuCapabilityValue -Sku $SourceSku -Name 'Family')
+    $sourcePriority = Get-EffectivePriority -Vm $SourceVm
+    $details = @()
+    $unknown = $false
+
+    if ($null -eq $vcpus) {
+        return [pscustomobject]@{
+            Allowed     = $true
+            Unknown     = $true
+            Description = 'Quota unknown: SKU vCPU count was not reported.'
+        }
+    }
+
+    if ($ResolvedDirection -eq 'ToSpot') {
+        $spotRegionalUsage = Find-QuotaUsage -Usages $Usages -Regional -Spot
+        $spotRemaining = Get-RemainingQuota -Usage $spotRegionalUsage
+        if ($null -eq $spotRemaining) {
+            $unknown = $true
+            $details += 'Spot regional quota unknown'
+        }
+        elseif ($spotRemaining -lt $vcpus) {
+            return [pscustomobject]@{
+                Allowed     = $false
+                Unknown     = $false
+                Description = "Needs $vcpus vCPUs; Spot regional quota has $spotRemaining remaining."
+            }
+        }
+        else {
+            $details += "Spot regional quota has $spotRemaining remaining"
+        }
+    }
+    else {
+        $regionalUsage = Find-QuotaUsage -Usages $Usages -Regional
+        $regionalRemaining = Get-RemainingQuota -Usage $regionalUsage
+        if ($null -eq $regionalRemaining) {
+            $unknown = $true
+            $details += 'Regional vCPU quota unknown'
+        }
+        elseif ($regionalRemaining -lt $vcpus) {
+            return [pscustomobject]@{
+                Allowed     = $false
+                Unknown     = $false
+                Description = "Needs $vcpus vCPUs; regional quota has $regionalRemaining remaining."
+            }
+        }
+        else {
+            $details += "Regional quota has $regionalRemaining remaining"
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($family)) {
+        $unknown = $true
+        $details += 'family quota unknown'
+    }
+    else {
+        $familyUsage = if ($ResolvedDirection -eq 'ToSpot') {
+            $spotFamilyUsage = Find-QuotaUsage -Usages $Usages -Family $family -Spot
+            if ($spotFamilyUsage) {
+                $spotFamilyUsage
+            }
+            else {
+                Find-QuotaUsage -Usages $Usages -Family $family
+            }
+        }
+        else {
+            Find-QuotaUsage -Usages $Usages -Family $family
+        }
+
+        $credit = 0
+        if ($ResolvedDirection -eq 'ToSpot' -and $sourcePriority -notin @('Spot', 'Low') -and $sourceFamily -eq $family -and $null -ne $sourceVcpus) {
+            $credit = $sourceVcpus
+        }
+
+        $familyRemaining = Get-RemainingQuota -Usage $familyUsage -Credit $credit
+        if ($null -eq $familyRemaining) {
+            $unknown = $true
+            $details += "$family quota unknown"
+        }
+        elseif ($familyRemaining -lt $vcpus) {
+            return [pscustomobject]@{
+                Allowed     = $false
+                Unknown     = $false
+                Description = "Needs $vcpus vCPUs; $family quota has $familyRemaining remaining."
+            }
+        }
+        else {
+            $details += "$family quota has $familyRemaining remaining"
+        }
+    }
+
+    return [pscustomobject]@{
+        Allowed     = $true
+        Unknown     = $unknown
+        Description = "vCPUs=$vcpus; " + ($details -join '; ')
+    }
+}
+
+function Test-SkuUnrestricted {
+    param($Sku)
+
+    return (-not $Sku.restrictions -or @($Sku.restrictions).Count -eq 0)
+}
+
+function Test-SkuMatchesDirection {
+    param(
+        $Sku,
+        [string]$ResolvedDirection
+    )
+
+    if ($ResolvedDirection -ne 'ToSpot') {
+        return $true
+    }
+
+    return (Get-SkuCapabilityValue -Sku $Sku -Name 'LowPriorityCapable') -eq 'True'
+}
+
+function ConvertTo-DoubleOrNull {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    $parsed = 0.0
+    if ([double]::TryParse(([string]$Value), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+        return $parsed
+    }
+
+    return $null
+}
+
+function Get-SkuSimilarityScore {
+    param(
+        $Sku,
+        $SourceSku
+    )
+
+    $family = [string](Get-SkuCapabilityValue -Sku $Sku -Name 'Family')
+    $sourceFamily = [string](Get-SkuCapabilityValue -Sku $SourceSku -Name 'Family')
+    $vcpus = ConvertTo-IntOrNull -Value (Get-SkuCapabilityValue -Sku $Sku -Name 'vCPUs')
+    $sourceVcpus = ConvertTo-IntOrNull -Value (Get-SkuCapabilityValue -Sku $SourceSku -Name 'vCPUs')
+    $memory = ConvertTo-DoubleOrNull -Value (Get-SkuCapabilityValue -Sku $Sku -Name 'MemoryGB')
+    $sourceMemory = ConvertTo-DoubleOrNull -Value (Get-SkuCapabilityValue -Sku $SourceSku -Name 'MemoryGB')
+
+    $score = 0.0
+    if ($family -ne $sourceFamily) {
+        $score += 1000000
+    }
+
+    if ($null -ne $vcpus -and $null -ne $sourceVcpus) {
+        $score += ([math]::Abs($vcpus - $sourceVcpus) * 1000)
+    }
+    else {
+        $score += 100000
+    }
+
+    if ($null -ne $memory -and $null -ne $sourceMemory) {
+        $score += ([math]::Abs($memory - $sourceMemory) * 10)
+    }
+    else {
+        $score += 10000
+    }
+
+    return $score
+}
+
+function Get-SkuCatalog {
+    param([string]$Location)
+
+    Write-Info 'Reading Azure VM SKU catalog for the selected region.'
+    Write-WarningLine 'The SKU catalog lookup can take 30-120 seconds in some tenants.'
+    return @(Invoke-AzJson -Arguments @(
+            'vm', 'list-skus',
+            '--location', $Location,
+            '--all',
+            '--query', "[?resourceType=='virtualMachines'].{name:name,restrictions:restrictions,capabilities:capabilities}",
+            '-o', 'json'
+        ))
+}
+
+function Get-QuotaEligibleSkus {
+    param(
+        [object[]]$Skus,
+        [object[]]$Usages,
+        [string]$ResolvedDirection,
+        $SourceSku,
+        $SourceVm
+    )
+
+    $eligible = @()
+    $blockedCount = 0
+    $unknownCount = 0
+
+    foreach ($sku in @($Skus)) {
+        if (-not (Test-SkuUnrestricted -Sku $sku)) {
+            continue
+        }
+
+        if (-not (Test-SkuMatchesDirection -Sku $sku -ResolvedDirection $ResolvedDirection)) {
+            continue
+        }
+
+        $quota = Test-SkuQuota -Sku $sku -Usages $Usages -ResolvedDirection $ResolvedDirection -SourceSku $SourceSku -SourceVm $SourceVm
+        if (-not $quota.Allowed) {
+            $blockedCount++
+            continue
+        }
+
+        if ($quota.Unknown) {
+            $unknownCount++
+        }
+
+        $eligible += [pscustomobject]@{
+            name             = $sku.name
+            sku              = $sku
+            quotaDescription = $quota.Description
+            score            = Get-SkuSimilarityScore -Sku $sku -SourceSku $SourceSku
+        }
+    }
+
+    if ($blockedCount -gt 0) {
+        Write-WarningLine "Hid $blockedCount SKU option(s) that appear to exceed available quota."
+    }
+
+    if ($unknownCount -gt 0) {
+        Write-WarningLine "Kept $unknownCount SKU option(s) visible because quota could not be matched confidently."
+    }
+
+    return @($eligible | Sort-Object score, name)
+}
+
+function Select-PagedSku {
+    param(
+        [string]$Title,
+        [object[]]$Candidates
+    )
+
+    $pageSize = 5
+    $offset = 0
+
+    while ($true) {
+        $page = @($Candidates | Select-Object -Skip $offset -First $pageSize)
+        $options = foreach ($candidate in $page) {
+            [pscustomobject]@{
+                Label       = $candidate.name
+                Description = $candidate.quotaDescription
+                Value       = $candidate.name
+            }
+        }
+
+        if (($offset + $pageSize) -lt $Candidates.Count) {
+            $options += [pscustomobject]@{
+                Label       = 'Show 5 more'
+                Description = "Showing $($offset + 1)-$($offset + $page.Count) of $($Candidates.Count)."
+                Value       = '__more__'
+            }
+        }
+
+        $options += [pscustomobject]@{
+            Label       = 'Enter a SKU manually'
+            Description = 'Use this if the SKU you want is not listed or quota matching was inconclusive.'
+            Value       = '__manual__'
+        }
+
+        $selected = Read-MenuChoice -Title $Title -Options $options -Default 1
+        if ($selected -eq '__more__') {
+            $offset += $pageSize
+            continue
+        }
+
+        if ($selected -eq '__manual__') {
+            return (Read-RequiredText -Prompt 'Target VM size' -ExistingValue $null)
+        }
+
+        return $selected
+    }
 }
 
 function Select-RunMode {
@@ -453,9 +882,10 @@ function Select-RunMode {
                 Value       = 'Plan'
             },
             [pscustomobject]@{
-                Label       = 'Execute conversion'
-                Description = 'Run the inferred Regular -> Spot or Spot -> Regular wrapper recreation after confirmation.'
-                Value       = 'Execute'
+                Label           = 'Execute conversion'
+                Description     = 'Run the inferred Regular -> Spot or Spot -> Regular wrapper recreation after confirmation.'
+                WaitDescription = 'Next steps still do discovery and command preview first; Azure is not changed until the final exact confirmation.'
+                Value           = 'Execute'
             }
         )
 }
@@ -479,18 +909,21 @@ function Select-Subscription {
             -Default 1 `
             -Options @(
                 [pscustomobject]@{
-                    Label       = 'Use current subscription'
-                    Description = 'Continue with the active Azure CLI context shown above.'
-                    Value       = 'current'
+                    Label           = 'Use current subscription'
+                    Description     = 'Continue with the active Azure CLI context shown above.'
+                    WaitDescription = 'Next you choose how to identify the VM. Browsing VMs may take 10-60 seconds in larger subscriptions; manual entry avoids that list call.'
+                    Value           = 'current'
                 },
                 [pscustomobject]@{
-                    Label       = 'Choose another subscription'
-                    Description = 'List visible subscriptions and switch before continuing.'
-                    Value       = 'switch'
+                    Label           = 'Choose another subscription'
+                    Description     = 'List visible subscriptions and switch before continuing.'
+                    WaitDescription = 'Listing subscriptions is usually quick, but Cloud Shell can pause briefly while Azure CLI refreshes account data.'
+                    Value           = 'switch'
                 }
             )
 
         if ($choice -eq 'switch') {
+            Write-Info 'Reading visible subscriptions from Azure CLI.'
             $subs = @(Invoke-AzJson -Arguments @('account', 'list', '--query', '[].{name:name,id:id,isDefault:isDefault}', '-o', 'json'))
             $options = foreach ($sub in $subs) {
                 [pscustomobject]@{
@@ -522,9 +955,35 @@ function Select-TargetVm {
         Write-Fail 'ResourceGroupName and VmName are required in non-interactive mode.'
     }
 
+    $lookupMode = Read-MenuChoice `
+        -Title 'Source VM lookup' `
+        -Default 1 `
+        -Options @(
+            [pscustomobject]@{
+                Label           = 'Browse VMs in current subscription'
+                Description     = 'Lists VM resource records first; detailed power, NIC, and disk inventory is read after you choose one.'
+                WaitDescription = 'The next Azure CLI call lists VM resources. It is usually quick, but large subscriptions can take a minute or more.'
+                Value           = 'browse'
+            },
+            [pscustomobject]@{
+                Label       = 'Enter VM manually'
+                Description = 'Fastest path when you already know the resource group and VM name.'
+                Value       = 'manual'
+            }
+        )
+
+    if ($lookupMode -eq 'manual') {
+        return [pscustomobject]@{
+            resourceGroup = Read-RequiredText -Prompt 'Resource group name' -ExistingValue $ResourceGroupName
+            name          = Read-RequiredText -Prompt 'VM name' -ExistingValue $VmName
+        }
+    }
+
+    Write-Section 'VM discovery'
+    Write-Info 'Reading VM list from the active subscription. Large subscriptions can take a moment.'
     $vms = @(Invoke-AzJson -Arguments @(
-            'vm', 'list', '-d',
-            '--query', '[].{name:name,resourceGroup:resourceGroup,location:location,powerState:powerState,priority:priority,size:hardwareProfile.vmSize,os:storageProfile.osDisk.osType,privateIps:privateIps}',
+            'vm', 'list',
+            '--query', '[].{name:name,resourceGroup:resourceGroup,location:location,priority:priority,size:hardwareProfile.vmSize,os:storageProfile.osDisk.osType}',
             '-o', 'json'
         ))
 
@@ -536,9 +995,10 @@ function Select-TargetVm {
         $priority = if ($vm.priority) { $vm.priority } else { 'Regular' }
         $next = if ($priority -in @('Spot', 'Low')) { 'ToRegular' } else { 'ToSpot' }
         [pscustomobject]@{
-            Label       = "$($vm.resourceGroup) / $($vm.name)"
-            Description = "$($vm.location), $($vm.size), $($vm.os), $($vm.powerState), priority=$priority, inferred=$next, IPs=$($vm.privateIps)"
-            Value       = $vm
+            Label           = "$($vm.resourceGroup) / $($vm.name)"
+            Description     = "$($vm.location), $($vm.size), $($vm.os), priority=$priority, inferred=$next"
+            WaitDescription = 'Next the script reads detailed VM inventory: instance view, NICs, disks, and extensions. That can take 30-90 seconds.'
+            Value           = $vm
         }
     }
 
@@ -570,6 +1030,7 @@ function Get-VmInventory {
 
     Write-Section 'Inventory'
     Write-Info 'Reading VM, NIC, disk, extension, and instance-view data.'
+    Write-WarningLine 'This is the most detailed discovery step. Cloud Shell may pause for 30-90 seconds while Azure CLI reads related resources.'
 
     $vm = Invoke-AzJson -Arguments @('vm', 'show', '-g', $ResourceGroup, '-n', $Name, '-o', 'json')
     $instanceView = Invoke-AzJson -Arguments @('vm', 'get-instance-view', '-g', $ResourceGroup, '-n', $Name, '-o', 'json')
@@ -689,9 +1150,10 @@ function Select-Direction {
         -Default 1 `
         -Options @(
             [pscustomobject]@{
-                Label       = $label
-                Description = $description
-                Value       = $inferred
+                Label           = $label
+                Description     = $description
+                WaitDescription = 'Next the wizard asks for target size and safety choices. Azure resources are still unchanged.'
+                Value           = $inferred
             },
             [pscustomobject]@{
                 Label       = 'Stop without building commands'
@@ -714,35 +1176,80 @@ function Select-TargetSku {
     $currentSize = $Vm.hardwareProfile.vmSize
     $title = if ($ResolvedDirection -eq 'ToSpot') { 'Spot VM SKU' } else { 'Regular VM SKU' }
     $browseDescription = if ($ResolvedDirection -eq 'ToSpot') {
-        'Browse unrestricted Spot-capable SKUs in this region.'
+        'Browse unrestricted, quota-eligible Spot-capable SKUs in this region.'
     }
     else {
-        'Browse unrestricted VM SKUs in this region.'
+        'Browse unrestricted, quota-eligible VM SKUs in this region.'
     }
+
+    $allSkus = @(Get-SkuCatalog -Location $Vm.location)
+    $quotaUsages = @(Get-QuotaUsage -Location $Vm.location)
+    $sourceSku = @($allSkus | Where-Object { $_.name -eq $currentSize } | Select-Object -First 1)
+    if ($sourceSku.Count -eq 0) {
+        Write-WarningLine "Could not find source SKU '$currentSize' in the regional SKU catalog. Similarity ranking and quota checks may be less precise."
+        $sourceSku = [pscustomobject]@{
+            name         = $currentSize
+            restrictions = @()
+            capabilities = @()
+        }
+    }
+    else {
+        $sourceSku = $sourceSku[0]
+    }
+
+    $eligibleSkus = @(Get-QuotaEligibleSkus -Skus $allSkus -Usages $quotaUsages -ResolvedDirection $ResolvedDirection -SourceSku $sourceSku -SourceVm $Vm)
+    $currentEligible = @($eligibleSkus | Where-Object { $_.name -eq $currentSize } | Select-Object -First 1)
+    $recommendedSku = @($eligibleSkus | Select-Object -First 1)
+
+    if ($eligibleSkus.Count -eq 0) {
+        Write-WarningLine 'No unrestricted quota-eligible SKUs were found. Falling back to manual entry.'
+        return (Read-RequiredText -Prompt 'Target VM size' -ExistingValue $null)
+    }
+
+    $primarySkuOption = if ($currentEligible.Count -gt 0) {
+        [pscustomobject]@{
+            Label       = "Keep current size: $currentSize"
+            Description = "Available for the target priority. $($currentEligible[0].quotaDescription)"
+            Value       = $currentSize
+        }
+    }
+    elseif ($recommendedSku.Count -gt 0) {
+        [pscustomobject]@{
+            Label       = "Use closest available size: $($recommendedSku[0].name)"
+            Description = "Current size '$currentSize' was not available for target priority/quota. $($recommendedSku[0].quotaDescription)"
+            Value       = $recommendedSku[0].name
+        }
+    }
+    else {
+        $null
+    }
+
+    $menuOptions = @()
+    if ($primarySkuOption) {
+        $menuOptions += $primarySkuOption
+    }
+
+    $menuOptions += @(
+        [pscustomobject]@{
+            Label           = 'Browse discovered SKUs'
+            Description     = $browseDescription
+            WaitDescription = 'The browser shows 5 SKUs at a time so Cloud Shell stays readable.'
+            Value           = 'browse'
+        },
+        [pscustomobject]@{
+            Label       = 'Enter a different SKU manually'
+            Description = 'Example: Standard_D4s_v5 or Standard_D4ads_v6.'
+            Value       = 'manual'
+        }
+    )
 
     $choice = Read-MenuChoice `
         -Title $title `
         -Default 1 `
-        -Options @(
-            [pscustomobject]@{
-                Label       = "Keep current size: $currentSize"
-                Description = 'Recommended when you want the smallest wrapper change.'
-                Value       = 'current'
-            },
-            [pscustomobject]@{
-                Label       = 'Browse discovered SKUs'
-                Description = $browseDescription
-                Value       = 'browse'
-            },
-            [pscustomobject]@{
-                Label       = 'Enter a different SKU manually'
-                Description = 'Example: Standard_D4s_v5 or Standard_D4ads_v6.'
-                Value       = 'manual'
-            }
-        )
+        -Options $menuOptions
 
-    if ($choice -eq 'current') {
-        return $currentSize
+    if ($choice -ne 'browse' -and $choice -ne 'manual') {
+        return $choice
     }
 
     if ($choice -eq 'manual') {
@@ -751,36 +1258,20 @@ function Select-TargetSku {
 
     $filter = ''
     if (-not $NonInteractive) {
-        $filter = Read-Host 'Filter SKU names, or press Enter for the first 30 matches'
+        $filter = Read-Host 'Filter SKU names, or press Enter for the first 5 matches'
     }
 
-    $query = if ($ResolvedDirection -eq 'ToSpot') {
-        "[?resourceType=='virtualMachines' && capabilities[?name=='LowPriorityCapable' && value=='True']].{name:name,restrictions:restrictions}"
-    }
-    else {
-        "[?resourceType=='virtualMachines'].{name:name,restrictions:restrictions}"
-    }
-
-    $skus = @(Invoke-AzJson -Arguments @('vm', 'list-skus', '--location', $Vm.location, '--all', '--query', $query, '-o', 'json'))
+    $skus = $eligibleSkus
     if (-not [string]::IsNullOrWhiteSpace($filter)) {
         $skus = @($skus | Where-Object { $_.name -like "*$filter*" })
     }
 
-    $skus = @($skus | Where-Object { -not $_.restrictions -or $_.restrictions.Count -eq 0 } | Sort-Object name | Select-Object -First 30)
     if ($skus.Count -eq 0) {
-        Write-WarningLine 'No matching unrestricted SKUs were returned. Falling back to manual entry.'
+        Write-WarningLine 'No matching quota-eligible SKUs were returned. Falling back to manual entry.'
         return (Read-RequiredText -Prompt 'Target VM size' -ExistingValue $null)
     }
 
-    $options = foreach ($sku in $skus) {
-        [pscustomobject]@{
-            Label       = $sku.name
-            Description = 'Returned by az vm list-skus for this region without restrictions.'
-            Value       = $sku.name
-        }
-    }
-
-    return (Read-MenuChoice -Title "Choose $title" -Options $options -Default 1)
+    return (Select-PagedSku -Title "Choose $title" -Candidates $skus)
 }
 
 function Test-TargetSku {
@@ -791,6 +1282,7 @@ function Test-TargetSku {
     )
 
     try {
+        Write-Info "Validating SKU '$Size' in $Location."
         $query = "[?name=='$Size'].{name:name,restrictions:restrictions,lowPriority:capabilities[?name=='LowPriorityCapable'].value | [0]}"
         $matches = @(Invoke-AzJson -Arguments @('vm', 'list-skus', '--location', $Location, '--size', $Size, '--all', '--query', $query, '-o', 'json'))
         if ($matches.Count -eq 0) {
@@ -838,9 +1330,10 @@ function Resolve-SkuValidation {
                 Value       = $false
             },
             [pscustomobject]@{
-                Label       = 'Run live SKU validation'
-                Description = 'Calls az vm list-skus for the chosen size. Can take a while in some tenants.'
-                Value       = $true
+                Label           = 'Run live SKU validation'
+                Description     = 'Calls az vm list-skus for the chosen size. Can take a while in some tenants.'
+                WaitDescription = 'This validation call can take up to a minute, but it catches some SKU restrictions before execution.'
+                Value           = $true
             }
         )
 }

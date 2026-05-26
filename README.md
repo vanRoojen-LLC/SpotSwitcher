@@ -10,6 +10,13 @@ and the choices needed for the correct direction:
 - Spot or legacy Low priority -> convert to Regular
 
 Default mode is read-only plan generation.
+After subscription selection, choose whether to browse VMs in the subscription
+or enter the resource group and VM name manually. Manual entry avoids a
+subscription-wide VM list call.
+When converting to Spot, the SKU picker only offers the current VM size if it
+is Spot-capable and appears to fit available quota. Otherwise it recommends the
+closest unrestricted, quota-eligible Spot size. Browse results are shown five at
+a time.
 
 Run the latest version directly in Azure Cloud Shell PowerShell:
 
