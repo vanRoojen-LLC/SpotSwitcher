@@ -2696,6 +2696,50 @@ function Select-PagedSku {
     }
 }
 
+function Select-PagedVm {
+    param([object[]]$Vms)
+
+    $pageSize = 10
+    $offset = 0
+    $sortedVms = @($Vms | Sort-Object resourceGroup, name)
+
+    while ($true) {
+        $page = @($sortedVms | Select-Object -Skip $offset -First $pageSize)
+        $options = foreach ($vm in $page) {
+            $priority = if ($vm.priority) { $vm.priority } else { 'Regular' }
+            $next = if ($priority -in @('Spot', 'Low')) { 'ToRegular' } else { 'ToSpot' }
+            [pscustomobject]@{
+                Label           = "$($vm.resourceGroup) / $($vm.name)"
+                Description     = "$($vm.location), $($vm.size), $($vm.os), priority=$priority, inferred=$next"
+                WaitDescription = 'Next the script reads detailed VM inventory: instance view, NICs, disks, and extensions. That can take 30-90 seconds.'
+                Value           = $vm
+            }
+        }
+
+        if (($offset + $pageSize) -lt $sortedVms.Count) {
+            $options += [pscustomobject]@{
+                Label       = 'Show 10 more'
+                Description = "Showing $($offset + 1)-$($offset + $page.Count) of $($sortedVms.Count)."
+                Value       = '__more__'
+            }
+        }
+
+        $options += [pscustomobject]@{
+            Label       = 'Enter VM manually'
+            Description = 'Type the resource group and VM name yourself.'
+            Value       = '__manual__'
+        }
+
+        $selected = Read-MenuChoice -Title 'Source VM' -Options $options -Default 1
+        if ($selected -eq '__more__') {
+            $offset += $pageSize
+            continue
+        }
+
+        return $selected
+    }
+}
+
 function Select-StartupAction {
     if ($CleanupSnapshots) {
         return 'CleanupSnapshots'
@@ -2861,24 +2905,7 @@ function Select-TargetVm {
         Write-Fail 'No VMs were found in the active subscription.'
     }
 
-    $options = foreach ($vm in ($vms | Sort-Object resourceGroup, name)) {
-        $priority = if ($vm.priority) { $vm.priority } else { 'Regular' }
-        $next = if ($priority -in @('Spot', 'Low')) { 'ToRegular' } else { 'ToSpot' }
-        [pscustomobject]@{
-            Label           = "$($vm.resourceGroup) / $($vm.name)"
-            Description     = "$($vm.location), $($vm.size), $($vm.os), priority=$priority, inferred=$next"
-            WaitDescription = 'Next the script reads detailed VM inventory: instance view, NICs, disks, and extensions. That can take 30-90 seconds.'
-            Value           = $vm
-        }
-    }
-
-    $options += [pscustomobject]@{
-        Label       = 'Enter VM manually'
-        Description = 'Type the resource group and VM name yourself.'
-        Value       = '__manual__'
-    }
-
-    $selected = Read-MenuChoice -Title 'Source VM' -Options $options -Default 1
+    $selected = Select-PagedVm -Vms $vms
     if ($selected -eq '__manual__') {
         return [pscustomobject]@{
             resourceGroup = Read-RequiredText -Prompt 'Resource group name' -ExistingValue $ResourceGroupName
