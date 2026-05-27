@@ -37,7 +37,7 @@ back to legacy compute usage, which may not expose Spot quota.
 Run the latest version directly in Azure Cloud Shell PowerShell:
 
 ```powershell
-iwr https://raw.githubusercontent.com/vanRoojen-LLC/SpotSwitcher/main/Switch-AzureVmSpotPriority.ps1 -OutFile ./Switch-AzureVmSpotPriority.ps1; ./Switch-AzureVmSpotPriority.ps1
+iwr https://raw.githubusercontent.com/vanRoojen-LLC/SpotSwitcher/refs/heads/main/Switch-AzureVmSpotPriority.ps1 -OutFile ./Switch-AzureVmSpotPriority.ps1; ./Switch-AzureVmSpotPriority.ps1
 ```
 
 ```powershell
