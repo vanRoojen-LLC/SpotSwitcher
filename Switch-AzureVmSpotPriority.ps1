@@ -17,7 +17,8 @@ Direction is inferred from the live source VM:
 The script uses Azure CLI and recreates only the VM resource wrapper. It keeps
 the existing managed OS disk, managed data disks, NICs, tags, VM size choice,
 Trusted Launch settings, license type, boot diagnostics, and identities where
-Azure CLI can safely reapply them.
+Azure CLI can safely reapply them. It also returns stable source power states:
+running, stopped, or deallocated.
 
 Default mode is Plan, which performs discovery, writes a plan file, previews the
 commands, and then asks whether to execute that just-built plan. Execute mode
@@ -148,6 +149,8 @@ Safety defaults:
   - Execute mode sets OS disk, data disks, and NIC deleteOption to Detach.
   - Dynamic private IPs can be pinned to static before wrapper deletion.
   - Incremental snapshots can be created after deallocation.
+  - Stable source power states are restored after recreation: running remains
+    running, stopped is stopped, and deallocated is deallocated.
   - Availability-set membership is preserved for regular VMs, but must be
     intentionally dropped when converting to Spot because Azure does not support
     Spot VMs in availability sets.
@@ -838,6 +841,60 @@ function Get-EffectivePriority {
     }
 
     return 'Regular'
+}
+
+function Get-VmPowerStateStatus {
+    param($InstanceView)
+
+    return (@($InstanceView.instanceView.statuses) | Where-Object { $_.code -like 'PowerState/*' } | Select-Object -First 1)
+}
+
+function Get-VmPowerStateCode {
+    param($InstanceView)
+
+    $status = Get-VmPowerStateStatus -InstanceView $InstanceView
+    if ($status -and $status.code) {
+        return [string]$status.code
+    }
+
+    return 'PowerState/unknown'
+}
+
+function Get-VmPowerStateDisplay {
+    param($InstanceView)
+
+    $status = Get-VmPowerStateStatus -InstanceView $InstanceView
+    if ($status -and $status.displayStatus) {
+        return [string]$status.displayStatus
+    }
+
+    return (Get-VmPowerStateCode -InstanceView $InstanceView)
+}
+
+function Test-StableVmPowerState {
+    param([string]$PowerStateCode)
+
+    return @('PowerState/running', 'PowerState/stopped', 'PowerState/deallocated') -contains $PowerStateCode
+}
+
+function Assert-StableSourcePowerState {
+    param($Inventory)
+
+    $powerStateCode = Get-VmPowerStateCode -InstanceView $Inventory.instanceView
+    if (-not (Test-StableVmPowerState -PowerStateCode $powerStateCode)) {
+        Write-Fail "Source VM power state is '$powerStateCode'. Wait until the VM is running, stopped, or deallocated so SpotSwitcher can restore the original power state after conversion."
+    }
+}
+
+function Get-PowerStateRestoreSummary {
+    param([string]$PowerStateCode)
+
+    switch ($PowerStateCode) {
+        'PowerState/running' { return 'recreated VM remains running after az vm create' }
+        'PowerState/stopped' { return 'az vm stop after recreation' }
+        'PowerState/deallocated' { return 'az vm deallocate after recreation' }
+        default { return 'unsupported source power state' }
+    }
 }
 
 function Get-SkuCapabilityValue {
@@ -2121,7 +2178,8 @@ function Show-InventorySummary {
 
     $vm = $Inventory.vm
     $priority = Get-EffectivePriority -Vm $vm
-    $power = (@($Inventory.instanceView.instanceView.statuses) | Where-Object { $_.code -like 'PowerState/*' } | Select-Object -First 1).displayStatus
+    $power = Get-VmPowerStateDisplay -InstanceView $Inventory.instanceView
+    $powerCode = Get-VmPowerStateCode -InstanceView $Inventory.instanceView
     $availabilitySetId = if ($vm.availabilitySet -and $vm.availabilitySet.id) { $vm.availabilitySet.id } else { '<none>' }
     $primaryNicId = Get-PrimaryNicId -Vm $vm
 
@@ -2141,6 +2199,13 @@ function Show-InventorySummary {
     Write-Host ("Avail. set:  {0}" -f $availabilitySetId)
     if ($primaryNicId) {
         Write-Host ("Primary NIC: {0}" -f $primaryNicId)
+    }
+
+    if (Test-StableVmPowerState -PowerStateCode $powerCode) {
+        Write-Host ("Final power: {0}" -f (Get-PowerStateRestoreSummary -PowerStateCode $powerCode))
+    }
+    else {
+        Write-WarningLine "Source VM power state is '$powerCode'. Wait until the VM is running, stopped, or deallocated before converting."
     }
 
     foreach ($nic in @($Inventory.nics)) {
@@ -2663,9 +2728,10 @@ function New-Plan {
 
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $vm = $Inventory.vm
+    $sourcePowerStateCode = Get-VmPowerStateCode -InstanceView $Inventory.instanceView
 
     [ordered]@{
-        planVersion = 2
+        planVersion = 3
         generatedAt = (Get-Date).ToString('o')
         planId = "$($vm.name)-$($Decisions.direction)-$stamp"
         subscription = @{
@@ -2680,6 +2746,11 @@ function New-Plan {
             nics = $Inventory.nics
             osDisk = $Inventory.osDisk
             dataDisks = $Inventory.dataDisks
+            powerState = @{
+                code = $sourcePowerStateCode
+                displayStatus = Get-VmPowerStateDisplay -InstanceView $Inventory.instanceView
+                restoreSummary = Get-PowerStateRestoreSummary -PowerStateCode $sourcePowerStateCode
+            }
         }
         decisions = $Decisions
     }
@@ -2863,6 +2934,39 @@ function Get-SnapshotCommands {
     return $commands
 }
 
+function Get-PowerStateRestoreCommands {
+    param($Plan)
+
+    $vm = $Plan.source.vm
+    $powerStateCode = $Plan.source.powerState.code
+    if ([string]::IsNullOrWhiteSpace($powerStateCode)) {
+        $powerStateCode = Get-VmPowerStateCode -InstanceView $Plan.source.instanceView
+    }
+
+    switch ($powerStateCode) {
+        'PowerState/running' {
+            return @()
+        }
+        'PowerState/stopped' {
+            return @(New-AzCommand -Description 'Return VM to original power state: stopped (allocated).' -Arguments @(
+                    'vm', 'stop',
+                    '-g', $vm.resourceGroup,
+                    '-n', $vm.name
+                ))
+        }
+        'PowerState/deallocated' {
+            return @(New-AzCommand -Description 'Return VM to original power state: deallocated.' -Arguments @(
+                    'vm', 'deallocate',
+                    '-g', $vm.resourceGroup,
+                    '-n', $vm.name
+                ))
+        }
+        default {
+            Write-Fail "Cannot restore unsupported source VM power state '$powerStateCode'."
+        }
+    }
+}
+
 function Get-PostCreateCommands {
     param($Plan)
 
@@ -2993,6 +3097,7 @@ function Get-SwitchCommands {
     )
     $commands += New-AzCommand -Description "Recreate the VM as $targetLabel from the preserved OS disk and NICs." -Arguments (Get-CreateVmArgs -Plan $Plan)
     $commands += Get-PostCreateCommands -Plan $Plan
+    $commands += Get-PowerStateRestoreCommands -Plan $Plan
 
     return $commands
 }
@@ -3047,6 +3152,8 @@ function Show-DecisionSummary {
     Write-Section 'Decision summary'
     Write-Host ("Direction:        {0}" -f $Plan.decisions.direction)
     Write-Host ("Target SKU:       {0}" -f $Plan.decisions.targetSku)
+    Write-Host ("Original power:   {0}" -f $Plan.source.powerState.displayStatus)
+    Write-Host ("Final power:      {0}" -f $Plan.source.powerState.restoreSummary)
     if ($Plan.decisions.direction -eq 'ToSpot') {
         Write-Host ("Eviction policy:  {0}" -f $Plan.decisions.evictionPolicy)
         Write-Host ("Max price:        {0}" -f $Plan.decisions.maxPrice)
@@ -3089,6 +3196,7 @@ function Invoke-Main {
     $target = Select-TargetVm
     $inventory = Get-VmInventory -ResourceGroup $target.resourceGroup -Name $target.name
     Show-InventorySummary -Inventory $inventory
+    Assert-StableSourcePowerState -Inventory $inventory
 
     $resolvedDirection = Select-Direction -Inventory $inventory
     if ($resolvedDirection -eq 'Cancel') {
@@ -3126,7 +3234,8 @@ function Invoke-Main {
         'vm', 'show',
         '-g', $plan.source.vm.resourceGroup,
         '-n', $plan.source.vm.name,
-        '--query', '{priority:priority,evictionPolicy:evictionPolicy,vmSize:hardwareProfile.vmSize,availabilitySet:availabilitySet.id,osDisk:storageProfile.osDisk.managedDisk.id,nics:networkProfile.networkInterfaces[].{id:id,primary:primary},tags:tags}',
+        '-d',
+        '--query', '{powerState:powerState,priority:priority,evictionPolicy:evictionPolicy,vmSize:hardwareProfile.vmSize,availabilitySet:availabilitySet.id,osDisk:storageProfile.osDisk.managedDisk.id,nics:networkProfile.networkInterfaces[].{id:id,primary:primary},tags:tags}',
         '-o', 'json'
     ) -Description 'Reading recreated VM summary.'
 

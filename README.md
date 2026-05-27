@@ -23,6 +23,9 @@ for exact confirmation to delete them.
 Default mode is read-only plan generation, followed by a prompt to execute the
 just-previewed plan. Azure resources are not changed unless you choose to
 execute and pass the final exact confirmation prompt.
+During conversion, SpotSwitcher records the source VM power state and restores
+stable states after recreation: running VMs remain running, stopped VMs are
+stopped again, and deallocated VMs are deallocated again.
 After subscription selection, choose whether to browse VMs in the subscription
 or enter the resource group and VM name manually. Manual entry avoids a
 subscription-wide VM list call.
