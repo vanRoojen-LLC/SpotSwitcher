@@ -16,6 +16,10 @@ and the choices needed for the correct direction:
 - Regular or null priority -> convert to Spot
 - Spot or legacy Low priority -> convert to Regular
 
+The opening menu also includes a snapshot cleanup task. Cleanup lists snapshots
+created by SpotSwitcher, identified by the script's snapshot tags, before asking
+for exact confirmation to delete them.
+
 Default mode is read-only plan generation, followed by a prompt to execute the
 just-previewed plan. Azure resources are not changed unless you choose to
 execute and pass the final exact confirmation prompt.
@@ -42,6 +46,12 @@ iwr https://raw.githubusercontent.com/vanRoojen-LLC/SpotSwitcher/refs/heads/main
 
 ```powershell
 ./Switch-AzureVmSpotPriority.ps1
+```
+
+Clean up snapshots created by SpotSwitcher:
+
+```powershell
+./Switch-AzureVmSpotPriority.ps1 -CleanupSnapshots
 ```
 
 Execute interactively after reviewing the generated command plan:

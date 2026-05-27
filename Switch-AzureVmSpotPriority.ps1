@@ -24,6 +24,10 @@ commands, and then asks whether to execute that just-built plan. Execute mode
 requires an exact confirmation unless -Force is supplied for unattended
 automation.
 
+The opening menu can also clean up incremental snapshots created by SpotSwitcher.
+Cleanup lists matching snapshots first and requires exact confirmation before
+deleting them.
+
 .EXAMPLE
 ./Switch-AzureVmSpotPriority.ps1
 
@@ -48,6 +52,12 @@ commands, then require exact confirmation before executing.
   -CreateSnapshots Yes
 
 Run unattended with explicit choices.
+
+.EXAMPLE
+./Switch-AzureVmSpotPriority.ps1 -CleanupSnapshots
+
+List snapshots created by SpotSwitcher in the active subscription, then require
+exact confirmation before deleting them.
 #>
 
 [CmdletBinding()]
@@ -88,6 +98,7 @@ param(
     [string]$DropAvailabilitySetForSpot = 'Auto',
 
     [string]$PlanPath,
+    [switch]$CleanupSnapshots,
     [switch]$NonInteractive,
     [switch]$Force,
     [switch]$Help
@@ -101,6 +112,9 @@ SpotSwitcher - Azure VM Regular <-> Spot conversion wizard
 
 Interactive:
   ./Switch-AzureVmSpotPriority.ps1
+
+Snapshot cleanup:
+  ./Switch-AzureVmSpotPriority.ps1 -CleanupSnapshots
 
 Interactive execution:
   ./Switch-AzureVmSpotPriority.ps1 -Mode Execute
@@ -129,6 +143,8 @@ Direction is based on the source VM:
 Safety defaults:
   - Plan mode is read-only until you explicitly choose to execute the previewed
     plan and pass the exact confirmation prompt.
+  - Snapshot cleanup lists only snapshots with SpotSwitcher markers before
+    requiring exact confirmation for deletion.
   - Execute mode sets OS disk, data disks, and NIC deleteOption to Detach.
   - Dynamic private IPs can be pinned to static before wrapper deletion.
   - Incremental snapshots can be created after deallocation.
@@ -511,7 +527,7 @@ function Confirm-Exact {
     }
 
     if ($NonInteractive) {
-        Write-Fail "Execute mode requires -Force when -NonInteractive is supplied."
+        Write-Fail "This operation requires -Force when -NonInteractive is supplied."
     }
 
     Write-Host ''
@@ -523,6 +539,181 @@ function Confirm-Exact {
     if ($answer -cne $Phrase) {
         Write-Fail "Confirmation did not match. No destructive changes were made at this step."
     }
+}
+
+function Get-TagValue {
+    param(
+        $Tags,
+        [string]$Name
+    )
+
+    if ($null -eq $Tags) {
+        return $null
+    }
+
+    if ($Tags -is [System.Collections.IDictionary]) {
+        if ($Tags.Contains($Name)) {
+            return [string]$Tags[$Name]
+        }
+        return $null
+    }
+
+    $property = $Tags.PSObject.Properties[$Name]
+    if ($property) {
+        return [string]$property.Value
+    }
+
+    return $null
+}
+
+function Test-SpotSwitcherSnapshotName {
+    param([string]$Name)
+
+    return ($Name -match '-To(Spot|Regular)-\d{8}-\d{6}(-|$)')
+}
+
+function ConvertTo-SpotSwitcherSnapshotRecord {
+    param($Snapshot)
+
+    $planId = Get-TagValue -Tags $Snapshot.tags -Name 'spotSwitcherPlanId'
+    $sourceVm = Get-TagValue -Tags $Snapshot.tags -Name 'sourceVm'
+    $sourceResourceGroup = Get-TagValue -Tags $Snapshot.tags -Name 'sourceResourceGroup'
+    $hasSpotSwitcherTags = (
+        -not [string]::IsNullOrWhiteSpace($planId) -and
+        -not [string]::IsNullOrWhiteSpace($sourceVm) -and
+        -not [string]::IsNullOrWhiteSpace($sourceResourceGroup)
+    )
+
+    if (-not $hasSpotSwitcherTags) {
+        return $null
+    }
+
+    $nameMatches = Test-SpotSwitcherSnapshotName -Name $Snapshot.name
+    $diskSizeGb = $Snapshot.diskSizeGb
+    if ($null -eq $diskSizeGb) {
+        $diskSizeGb = $Snapshot.diskSizeGB
+    }
+
+    return [pscustomobject]@{
+        id                  = $Snapshot.id
+        name                = $Snapshot.name
+        resourceGroup       = $Snapshot.resourceGroup
+        location            = $Snapshot.location
+        timeCreated         = $Snapshot.timeCreated
+        diskSizeGb          = $diskSizeGb
+        incremental         = $Snapshot.incremental
+        sourceVm            = $sourceVm
+        sourceResourceGroup = $sourceResourceGroup
+        spotSwitcherPlanId  = $planId
+        nameMatchesPattern  = [bool]$nameMatches
+    }
+}
+
+function Get-SpotSwitcherSnapshotCleanupInventory {
+    Write-Info 'Reading Azure snapshots in the active subscription.'
+    Write-Info 'SpotSwitcher will only delete snapshots carrying its snapshot tags.'
+
+    $snapshots = @(Invoke-AzJson `
+            -Arguments @(
+                'snapshot', 'list',
+                '--query', '[].{id:id,name:name,resourceGroup:resourceGroup,location:location,timeCreated:timeCreated,diskSizeGb:diskSizeGb,incremental:incremental,tags:tags}',
+                '-o', 'json'
+            ) `
+            -Description 'Snapshot lookup can take 10-60 seconds in subscriptions with many snapshots.' `
+            -TimeoutSeconds 120)
+
+    $deleteCandidates = @()
+    $nameOnlyCandidates = @()
+    foreach ($snapshot in $snapshots) {
+        $record = ConvertTo-SpotSwitcherSnapshotRecord -Snapshot $snapshot
+        if ($record) {
+            $deleteCandidates += $record
+            continue
+        }
+
+        if (Test-SpotSwitcherSnapshotName -Name $snapshot.name) {
+            $nameOnlyCandidates += [pscustomobject]@{
+                name          = $snapshot.name
+                resourceGroup = $snapshot.resourceGroup
+                location      = $snapshot.location
+                timeCreated   = $snapshot.timeCreated
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        deleteCandidates   = @($deleteCandidates | Sort-Object sourceResourceGroup, sourceVm, spotSwitcherPlanId, name)
+        nameOnlyCandidates = @($nameOnlyCandidates | Sort-Object resourceGroup, name)
+    }
+}
+
+function Show-SpotSwitcherSnapshotList {
+    param(
+        [object[]]$Snapshots,
+        [object[]]$NameOnlyCandidates
+    )
+
+    Write-Section 'Snapshots to delete'
+    if ($Snapshots.Count -eq 0) {
+        Write-Host 'No snapshots with SpotSwitcher cleanup tags were found.'
+    }
+    else {
+        Write-Host ("SpotSwitcher found {0} tagged snapshot(s) to delete:" -f $Snapshots.Count) -ForegroundColor White
+        foreach ($snapshot in $Snapshots) {
+            $created = if ($snapshot.timeCreated) { $snapshot.timeCreated } else { 'unknown created time' }
+            $size = if ($null -ne $snapshot.diskSizeGb) { "$($snapshot.diskSizeGb) GiB" } else { 'unknown size' }
+            $incremental = if ($null -ne $snapshot.incremental) { $snapshot.incremental } else { 'unknown' }
+            $namePatternText = if ($snapshot.nameMatchesPattern) { 'name matches SpotSwitcher pattern' } else { 'tag match only' }
+
+            Write-Host ''
+            Write-Host ("  - {0}" -f $snapshot.name) -ForegroundColor White
+            Write-Host ("    Resource group: {0}; location: {1}; created: {2}" -f $snapshot.resourceGroup, $snapshot.location, $created) -ForegroundColor Gray
+            Write-Host ("    Source VM: {0}/{1}; plan: {2}" -f $snapshot.sourceResourceGroup, $snapshot.sourceVm, $snapshot.spotSwitcherPlanId) -ForegroundColor Gray
+            Write-Host ("    Snapshot: {0}; incremental: {1}; match: {2}" -f $size, $incremental, $namePatternText) -ForegroundColor Gray
+        }
+    }
+
+    if ($NameOnlyCandidates.Count -gt 0) {
+        Write-Section 'Name-only matches skipped'
+        Write-WarningLine ("Found {0} snapshot name(s) that look like SpotSwitcher output but are missing the required SpotSwitcher tags." -f $NameOnlyCandidates.Count)
+        Write-Host 'They will not be deleted automatically. Review them manually if you expected older untagged snapshots.' -ForegroundColor Gray
+        foreach ($snapshot in $NameOnlyCandidates) {
+            Write-Host ("  - {0}/{1} ({2}, {3})" -f $snapshot.resourceGroup, $snapshot.name, $snapshot.location, $snapshot.timeCreated) -ForegroundColor Gray
+        }
+    }
+}
+
+function Invoke-SpotSwitcherSnapshotCleanup {
+    param($Account)
+
+    Write-Section 'SpotSwitcher snapshot cleanup'
+    Write-Host ("Subscription: {0} ({1})" -f $Account.name, $Account.id)
+    Write-WarningLine 'Cleanup deletes only snapshots tagged with sourceVm, sourceResourceGroup, and spotSwitcherPlanId.'
+
+    $inventory = Get-SpotSwitcherSnapshotCleanupInventory
+    $snapshots = @($inventory.deleteCandidates)
+    $nameOnlyCandidates = @($inventory.nameOnlyCandidates)
+    Show-SpotSwitcherSnapshotList -Snapshots $snapshots -NameOnlyCandidates $nameOnlyCandidates
+
+    if ($snapshots.Count -eq 0) {
+        Write-Section 'Cleanup complete'
+        Write-Host 'No Azure resources were changed.'
+        return
+    }
+
+    Confirm-Exact -Phrase "DELETE $($snapshots.Count) SPOTSWITCHER SNAPSHOTS"
+
+    $commands = foreach ($snapshot in $snapshots) {
+        New-AzCommand -Description "Delete snapshot $($snapshot.resourceGroup)/$($snapshot.name)." -Arguments @(
+            'snapshot', 'delete',
+            '--ids', $snapshot.id
+        )
+    }
+
+    Invoke-CommandList -Commands @($commands) -Execute $true
+
+    Write-Section 'Cleanup complete'
+    Write-Host ("Deleted {0} SpotSwitcher snapshot(s)." -f $snapshots.Count)
 }
 
 function Get-ResourceGroupFromId {
@@ -1681,6 +1872,39 @@ function Select-PagedSku {
     }
 }
 
+function Select-StartupAction {
+    if ($CleanupSnapshots) {
+        return 'CleanupSnapshots'
+    }
+
+    if ($NonInteractive) {
+        return 'ConvertVm'
+    }
+
+    return Read-MenuChoice `
+        -Title 'What do you want to do?' `
+        -Default 1 `
+        -Options @(
+            [pscustomobject]@{
+                Label           = 'Switch a VM between Regular and Spot'
+                Description     = 'Build a conversion plan, then optionally execute it after exact confirmation.'
+                WaitDescription = 'Next you choose plan-only or execute mode. Azure resources are still unchanged.'
+                Value           = 'ConvertVm'
+            },
+            [pscustomobject]@{
+                Label           = 'Clean up SpotSwitcher snapshots'
+                Description     = 'List tagged incremental snapshots created by this script, then confirm before deleting them.'
+                WaitDescription = 'Next SpotSwitcher reads snapshots in the active subscription. No snapshots are deleted until the exact confirmation prompt.'
+                Value           = 'CleanupSnapshots'
+            },
+            [pscustomobject]@{
+                Label       = 'Stop without changes'
+                Description = 'Exit now. No Azure resources will be changed.'
+                Value       = 'Stop'
+            }
+        )
+}
+
 function Select-RunMode {
     if ($Mode) {
         return $Mode
@@ -1709,6 +1933,10 @@ function Select-RunMode {
 }
 
 function Select-Subscription {
+    param(
+        [string]$NextStepDescription = 'Next you choose how to identify the VM. Browsing VMs may take 10-60 seconds in larger subscriptions; manual entry avoids that list call.'
+    )
+
     if ($Subscription) {
         Invoke-AzText -Arguments @('account', 'set', '--subscription', $Subscription) -Description "Selecting subscription '$Subscription'." | Out-Null
     }
@@ -1729,7 +1957,7 @@ function Select-Subscription {
                 [pscustomobject]@{
                     Label           = 'Use current subscription'
                     Description     = 'Continue with the active Azure CLI context shown above.'
-                    WaitDescription = 'Next you choose how to identify the VM. Browsing VMs may take 10-60 seconds in larger subscriptions; manual entry avoids that list call.'
+                    WaitDescription = $NextStepDescription
                     Value           = 'current'
                 },
                 [pscustomobject]@{
@@ -2841,6 +3069,19 @@ function Invoke-Main {
 
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
         Write-Fail 'Azure CLI was not found. Run this in Azure Cloud Shell or install az.'
+    }
+
+    $startupAction = Select-StartupAction
+    if ($startupAction -eq 'Stop') {
+        Write-Section 'Stopped'
+        Write-Host 'No Azure resources were changed.'
+        return
+    }
+
+    if ($startupAction -eq 'CleanupSnapshots') {
+        $account = Select-Subscription -NextStepDescription 'Next SpotSwitcher reads snapshots in the active subscription. No snapshots are deleted until the exact confirmation prompt.'
+        Invoke-SpotSwitcherSnapshotCleanup -Account $account
+        return
     }
 
     $selectedMode = Select-RunMode
