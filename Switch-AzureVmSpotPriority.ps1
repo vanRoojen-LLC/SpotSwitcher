@@ -160,9 +160,9 @@ Interactive SKU selection:
     encryption at host, OS disk size, Hyper-V generation, and source zone.
   - For Spot conversions, candidate SKUs must meet or exceed the source VM
     vCPU/RAM shape. If the current SKU is valid for the switch, it is listed
-    first as "Current SKU"; alternatives favor the same broad family/core token
-    such as D2 or E4 before falling back to lowest estimated whole USD/month
-    retail cost.
+    first as "Current SKU"; alternatives come from the same CPU/RAM-compatible
+    candidate set and are sorted by lowest estimated whole USD/month retail
+    cost.
   - The picker shows five SKU choices at a time. Use Custom filter to search
     all eligible SKUs by another token such as E2, D4s, or Standard_D4ads_v6.
   - For Regular conversions, candidate SKUs use the exact source VM vCPU/RAM
@@ -2576,34 +2576,6 @@ function Add-SkuPricing {
         })
 }
 
-function Get-SkuBroadFamilyCoreToken {
-    param([string]$SkuName)
-
-    if ([string]::IsNullOrWhiteSpace($SkuName)) {
-        return $null
-    }
-
-    $shortName = $SkuName -replace '^Standard_', ''
-    if ($shortName -match '^([A-Za-z]+)([0-9]+)') {
-        return ($matches[1] + $matches[2])
-    }
-
-    return $null
-}
-
-function Test-SkuBroadFamilyCoreMatch {
-    param(
-        [string]$SkuName,
-        [string]$Token
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Token)) {
-        return $false
-    }
-
-    return ((Get-SkuBroadFamilyCoreToken -SkuName $SkuName) -eq $Token)
-}
-
 function Copy-SkuChoice {
     param(
         $Candidate,
@@ -3623,28 +3595,13 @@ function Select-TargetSku {
         $alternatives = @($costSortedSkus | Where-Object { $_.name -ne $currentSize })
         $filterSkus = @(@($currentChoice) + @($alternatives))
 
-        $autoFilterToken = Get-SkuBroadFamilyCoreToken -SkuName $currentSize
-        if ($autoFilterToken) {
-            $similarAlternatives = @($alternatives | Where-Object { Test-SkuBroadFamilyCoreMatch -SkuName $_.name -Token $autoFilterToken })
-            $otherAlternatives = @($alternatives | Where-Object { -not (Test-SkuBroadFamilyCoreMatch -SkuName $_.name -Token $autoFilterToken) })
-            $alternatives = @($similarAlternatives + $otherAlternatives)
-            if ($similarAlternatives.Count -gt 0) {
-                Write-Info "Current SKU is valid for the target. Showing it first, then $autoFilterToken alternatives sorted by estimated monthly cost."
-            }
-            else {
-                Write-Info 'Current SKU is valid for the target. Showing it first, then alternatives sorted by estimated monthly cost.'
-            }
-        }
-        else {
-            Write-Info 'Current SKU is valid for the target. Showing it first, then alternatives sorted by estimated monthly cost.'
-        }
-
+        Write-Info 'Current SKU is valid for the target. Showing it first, then all CPU/RAM-compatible alternatives sorted by estimated monthly cost.'
         Write-Info 'Use Custom filter to search all eligible SKUs by another token such as E2 or D4s.'
         $displaySkus = @(@($currentChoice) + @($alternatives))
     }
     else {
         Write-Info "Current SKU '$currentSize' is not eligible for the target priority/quota, so it is not listed."
-        Write-Info 'Showing the lowest-cost eligible alternatives. Use Custom filter to search all eligible SKUs by another token such as E2 or D4s.'
+        Write-Info 'Showing the lowest-cost eligible alternatives from the CPU/RAM-compatible candidate set. Use Custom filter to search all eligible SKUs by another token such as E2 or D4s.'
         $displaySkus = $costSortedSkus
     }
 
@@ -4732,7 +4689,7 @@ function Resolve-ExecutePreviewedPlan {
 
     return Read-MenuChoice `
         -Title 'Run this conversion?' `
-        -Default 2 `
+        -Default 1 `
         -Options @(
             [pscustomobject]@{
                 Label           = 'Run now'

@@ -60,8 +60,8 @@ Reserved VM Instance savings are checked for Spot conversions where the current
 identity can read Azure reservations; matching reservations default to stopping
 unless the user accepts the cost impact.
 SKU browsing shows five choices at a time. When the current SKU is valid for the
-target priority/quota, it is listed first as Current SKU, followed by same broad
-family/core alternatives such as D2 or E4 and then cost-sorted options. Custom
+target priority/quota, it is listed first as Current SKU, followed by the rest
+of the CPU/RAM-compatible candidates sorted by estimated monthly cost. Custom
 filter searches all eligible SKU names by another token. Pricing is rounded to
 the nearest whole dollar and uses a 730-hour/month public retail estimate, not
 invoice-specific billing.
