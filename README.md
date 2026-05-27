@@ -185,6 +185,7 @@ bootstrap fields were present and intentionally omitted.
 - Privacy: <https://spotswitcher.app/privacy>
 - Terms: <https://spotswitcher.app/terms>
 - Support: <https://spotswitcher.app/support>
+- Security policy: <https://github.com/vanRoojen-LLC/SpotSwitcher/blob/main/SECURITY.md>
 - LLM context: <https://spotswitcher.app/llms.txt>
 - License: MIT
 
