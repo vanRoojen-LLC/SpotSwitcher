@@ -20,11 +20,17 @@ Default mode is read-only plan generation.
 After subscription selection, choose whether to browse VMs in the subscription
 or enter the resource group and VM name manually. Manual entry avoids a
 subscription-wide VM list call.
-When converting to Spot, the SKU picker only offers the current VM size if it
-is Spot-capable and appears to fit available quota. Otherwise it recommends the
+When choosing a target size, the SKU picker starts from the source VM's exact
+vCPU/RAM shape unless `-TargetCores` or `-TargetMemoryGB` override it. It also
+filters for source compatibility where Azure reports the data: CPU architecture,
+attached data disk count, NIC count, accelerated networking, Premium/Ultra disk
+support, encryption at host, OS disk size, Hyper-V generation, and source zone
+availability. For Spot conversions, it only offers the current VM size if it is
+Spot-capable and appears to fit available quota. Otherwise it recommends the
 closest unrestricted, quota-eligible Spot size. Browse results are shown five at
-a time. Quota filtering uses the Azure CLI `quota` extension when available,
-then falls back to legacy compute usage, which may not expose Spot quota.
+a time.
+Quota filtering uses the Azure CLI `quota` extension when available, then falls
+back to legacy compute usage, which may not expose Spot quota.
 
 Run the latest version directly in Azure Cloud Shell PowerShell:
 
@@ -60,6 +66,10 @@ Run unattended with explicit parameters:
   -CreateSnapshots Yes `
   -ValidateSku No
 ```
+
+If `-TargetSku` is omitted, the source VM's exact vCPU/RAM shape is used. Pass
+`-TargetCores` and `-TargetMemoryGB` to override that shape before browsing
+candidate SKUs.
 
 The script writes plan files to `~/clouddrive/SpotSwitcherPlans` in Cloud Shell
 when Cloud Drive is mounted, otherwise to `./SpotSwitcherPlans`.

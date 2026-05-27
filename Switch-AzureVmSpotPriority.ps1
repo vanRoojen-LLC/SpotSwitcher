@@ -63,6 +63,12 @@ param(
 
     [string]$TargetSku,
 
+    [ValidateRange(0, 4096)]
+    [int]$TargetCores = 0,
+
+    [ValidateRange(0, 1048576)]
+    [double]$TargetMemoryGB = 0,
+
     [ValidateSet('Deallocate', 'Delete')]
     [string]$EvictionPolicy,
 
@@ -104,6 +110,16 @@ Unattended execution:
     -Direction ToSpot -TargetSku <sku> -EvictionPolicy Deallocate -MaxPrice -1 `
     -PinPrivateIps Yes -CreateSnapshots Yes -ValidateSku No `
     -DropAvailabilitySetForSpot No
+
+Interactive SKU selection:
+  - If -TargetSku is omitted, the wizard uses the source VM vCPU/RAM shape by
+    default before running the slower Azure SKU metadata lookup.
+  - Candidate SKUs are filtered to the source VM architecture when Azure reports
+    CpuArchitectureType, so x64 VMs are not offered Arm64 sizes and vice versa.
+  - Candidate SKUs are also filtered for source VM attachment/platform needs:
+    data disks, NIC count, accelerated networking, Premium/Ultra storage,
+    encryption at host, OS disk size, Hyper-V generation, and source zone.
+  - Use -TargetCores and -TargetMemoryGB to override that exact hardware shape.
 
 Direction is based on the source VM:
   Regular/null priority -> ToSpot
@@ -601,6 +617,13 @@ function Get-SkuCapabilityValue {
         [string]$Name
     )
 
+    if ($Name -eq 'Family') {
+        $familyProperty = $Sku.PSObject.Properties['family']
+        if ($familyProperty -and -not [string]::IsNullOrWhiteSpace([string]$familyProperty.Value)) {
+            return [string]$familyProperty.Value
+        }
+    }
+
     $capability = @($Sku.capabilities | Where-Object { $_.name -eq $Name } | Select-Object -First 1)
     if ($capability.Count -gt 0) {
         return $capability[0].value
@@ -640,6 +663,12 @@ function Get-NormalizedQuotaText {
     }
 
     return ($Text.ToLowerInvariant() -replace '[^a-z0-9]', '')
+}
+
+function Test-QuotaTextIsSpot {
+    param([string]$NormalizedText)
+
+    return ($NormalizedText -match 'spot' -or $NormalizedText -match 'lowpriority')
 }
 
 function Get-FirstObjectValue {
@@ -851,11 +880,12 @@ function Find-QuotaUsage {
             continue
         }
 
-        if ($Spot -and $normalized -notmatch 'spot') {
+        $isSpotQuota = Test-QuotaTextIsSpot -NormalizedText $normalized
+        if ($Spot -and -not $isSpotQuota) {
             continue
         }
 
-        if (-not $Spot -and $normalized -match 'spot') {
+        if (-not $Spot -and $isSpotQuota) {
             continue
         }
 
@@ -1059,9 +1089,29 @@ function Test-SkuQuota {
 }
 
 function Test-SkuUnrestricted {
-    param($Sku)
+    param(
+        $Sku,
+        $SourceVm
+    )
 
-    return (-not $Sku.restrictions -or @($Sku.restrictions).Count -eq 0)
+    foreach ($restriction in @($Sku.restrictions)) {
+        $restrictionType = [string]$restriction.type
+        if ($restrictionType -eq 'Zone') {
+            $sourceZones = @($SourceVm.zones | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+            if ($sourceZones.Count -eq 0) {
+                continue
+            }
+
+            $restrictedZones = @($restriction.restrictionInfo.zones | ForEach-Object { [string]$_ })
+            if ($restrictedZones.Count -gt 0 -and @($sourceZones | Where-Object { $restrictedZones -contains [string]$_ }).Count -eq 0) {
+                continue
+            }
+        }
+
+        return $false
+    }
+
+    return $true
 }
 
 function Test-SkuMatchesDirection {
@@ -1075,6 +1125,57 @@ function Test-SkuMatchesDirection {
     }
 
     return (Get-SkuCapabilityValue -Sku $Sku -Name 'LowPriorityCapable') -eq 'True'
+}
+
+function Get-SkuArchitecture {
+    param($Sku)
+
+    $architecture = [string](Get-SkuCapabilityValue -Sku $Sku -Name 'CpuArchitectureType')
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        return $null
+    }
+
+    if ($architecture -match '^arm') {
+        return 'Arm64'
+    }
+
+    if ($architecture -match '^(x64|amd64)$') {
+        return 'x64'
+    }
+
+    return $architecture
+}
+
+function Get-SkuBoolCapability {
+    param(
+        $Sku,
+        [string]$Name
+    )
+
+    $value = [string](Get-SkuCapabilityValue -Sku $Sku -Name $Name)
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        return $null
+    }
+
+    return ($value -eq 'True')
+}
+
+function Test-SkuSupportsHyperVGeneration {
+    param(
+        $Sku,
+        [string]$Generation
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Generation)) {
+        return $true
+    }
+
+    $supported = [string](Get-SkuCapabilityValue -Sku $Sku -Name 'HyperVGenerations')
+    if ([string]::IsNullOrWhiteSpace($supported)) {
+        return $true
+    }
+
+    return (@($supported -split ',' | ForEach-Object { $_.Trim() }) -contains $Generation)
 }
 
 function ConvertTo-DoubleOrNull {
@@ -1127,18 +1228,319 @@ function Get-SkuSimilarityScore {
     return $score
 }
 
-function Get-SkuCatalog {
+function Format-MemoryGB {
+    param([double]$MemoryGB)
+
+    return $MemoryGB.ToString('0.##', [System.Globalization.CultureInfo]::InvariantCulture)
+}
+
+function Convert-MemoryMBToGB {
+    param($MemoryMB)
+
+    $memory = ConvertTo-IntOrNull -Value $MemoryMB
+    if ($null -eq $memory) {
+        return $null
+    }
+
+    return [math]::Round(($memory / 1024.0), 2)
+}
+
+function Convert-MemoryGBToMB {
+    param([double]$MemoryGB)
+
+    return [int][math]::Round(($MemoryGB * 1024), 0)
+}
+
+function Get-RegionalVmSizes {
     param([string]$Location)
 
-    Write-Info 'Reading Azure VM SKU catalog for the selected region.'
-    Write-WarningLine 'The SKU catalog lookup can take 30-120 seconds in some tenants.'
+    Write-Info 'Reading Azure VM size list for exact CPU/RAM matching.'
+    Write-WarningLine 'This lightweight lookup narrows candidate names before the slower SKU metadata call.'
+    return @(Invoke-AzJson -Arguments @(
+            'vm', 'list-sizes',
+            '--location', $Location,
+            '-o', 'json'
+        ) -TimeoutSeconds 30 -Description 'Reading VM sizes for the selected region.')
+}
+
+function Read-TargetHardwareShape {
+    param(
+        [string]$CurrentSize,
+        $SourceSize
+    )
+
+    $defaultCores = ConvertTo-IntOrNull -Value $SourceSize.numberOfCores
+    $defaultMemoryGB = Convert-MemoryMBToGB -MemoryMB $SourceSize.memoryInMB
+    $usingOverride = ($TargetCores -gt 0 -or $TargetMemoryGB -gt 0)
+
+    if ($TargetCores -gt 0) {
+        $cores = $TargetCores
+    }
+    elseif ($null -ne $defaultCores) {
+        $cores = $defaultCores
+    }
+    else {
+        if ($NonInteractive) {
+            Write-Fail 'TargetCores is required in non-interactive mode when the source VM size is not in az vm list-sizes.'
+        }
+
+        while ($true) {
+            $prompt = if ($null -ne $defaultCores) { "Target vCPU count [default $defaultCores]" } else { 'Target vCPU count' }
+            $answer = Read-Host $prompt
+            if ([string]::IsNullOrWhiteSpace($answer) -and $null -ne $defaultCores) {
+                $cores = $defaultCores
+                break
+            }
+
+            $parsed = 0
+            if ([int]::TryParse($answer, [ref]$parsed) -and $parsed -gt 0) {
+                $cores = $parsed
+                break
+            }
+
+            Write-WarningLine 'Enter a whole-number vCPU count, for example 2 or 4.'
+        }
+    }
+
+    if ($TargetMemoryGB -gt 0) {
+        $memoryGB = $TargetMemoryGB
+    }
+    elseif ($null -ne $defaultMemoryGB) {
+        $memoryGB = $defaultMemoryGB
+    }
+    else {
+        if ($NonInteractive) {
+            Write-Fail 'TargetMemoryGB is required in non-interactive mode when the source VM size is not in az vm list-sizes.'
+        }
+
+        while ($true) {
+            $defaultText = if ($null -ne $defaultMemoryGB) { Format-MemoryGB -MemoryGB $defaultMemoryGB } else { $null }
+            $prompt = if ($defaultText) { "Target RAM in GiB [default $defaultText]" } else { 'Target RAM in GiB' }
+            $answer = Read-Host $prompt
+            if ([string]::IsNullOrWhiteSpace($answer) -and $null -ne $defaultMemoryGB) {
+                $memoryGB = $defaultMemoryGB
+                break
+            }
+
+            $parsed = 0.0
+            if ([double]::TryParse($answer, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed) -and $parsed -gt 0) {
+                $memoryGB = $parsed
+                break
+            }
+
+            Write-WarningLine 'Enter a fixed RAM value in GiB, for example 8 or 16.'
+        }
+    }
+
+    $memoryText = Format-MemoryGB -MemoryGB $memoryGB
+    if ($usingOverride) {
+        Write-Info "Target shape override: $cores vCPU / $memoryText GiB RAM."
+    }
+    else {
+        Write-Info "Using source VM shape: $cores vCPU / $memoryText GiB RAM."
+    }
+    Write-WarningLine 'Only VM sizes with this exact vCPU and RAM shape will be considered before quota/SKU checks.'
+
+    return [pscustomobject]@{
+        Cores    = $cores
+        MemoryGB = $memoryGB
+        MemoryMB = Convert-MemoryGBToMB -MemoryGB $memoryGB
+    }
+}
+
+function Get-CandidateVmSizeNames {
+    param(
+        [object[]]$Sizes,
+        [int]$Cores,
+        [int]$MemoryMB
+    )
+
+    return @($Sizes |
+        Where-Object {
+            (ConvertTo-IntOrNull -Value $_.numberOfCores) -eq $Cores -and
+            (ConvertTo-IntOrNull -Value $_.memoryInMB) -eq $MemoryMB
+        } |
+        Select-Object -ExpandProperty name -Unique |
+        Sort-Object)
+}
+
+function Get-SkuCatalog {
+    param(
+        [string]$Location,
+        [string[]]$SizeNames
+    )
+
+    $query = "[?resourceType=='virtualMachines'].{name:name,family:family,restrictions:restrictions,capabilities:capabilities}"
+    $description = 'Reading Azure VM SKU catalog for the selected region.'
+    if ($SizeNames -and $SizeNames.Count -gt 0) {
+        $uniqueNames = @($SizeNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+        $nameJson = ConvertTo-Json @($uniqueNames) -Compress
+        $tick = [char]96
+        $query = "[?resourceType=='virtualMachines' && contains($tick$nameJson$tick, name)].{name:name,family:family,restrictions:restrictions,capabilities:capabilities}"
+        $description = "Reading Azure VM SKU metadata for $($uniqueNames.Count) exact CPU/RAM candidate size name(s)."
+    }
+
+    Write-Info $description
+    Write-WarningLine 'The SKU metadata lookup is the slower Azure call. SpotSwitcher will print progress every 5 seconds if Azure CLI stalls.'
     return @(Invoke-AzJson -Arguments @(
             'vm', 'list-skus',
             '--location', $Location,
+            '--resource-type', 'virtualMachines',
             '--all',
-            '--query', "[?resourceType=='virtualMachines'].{name:name,restrictions:restrictions,capabilities:capabilities}",
+            '--query', $query,
             '-o', 'json'
-        ))
+        ) -TimeoutSeconds 180 -Description $description)
+}
+
+function Test-DiskUsesPremiumStorage {
+    param($Disk)
+
+    if (-not $Disk -or -not $Disk.sku -or [string]::IsNullOrWhiteSpace([string]$Disk.sku.name)) {
+        return $false
+    }
+
+    return ([string]$Disk.sku.name) -match '^Premium'
+}
+
+function Test-DiskUsesUltraStorage {
+    param($Disk)
+
+    if (-not $Disk -or -not $Disk.sku -or [string]::IsNullOrWhiteSpace([string]$Disk.sku.name)) {
+        return $false
+    }
+
+    return ([string]$Disk.sku.name) -match '^Ultra'
+}
+
+function Get-SourceSkuRequirements {
+    param(
+        $Inventory,
+        $SourceSku
+    )
+
+    $vm = $Inventory.vm
+    $osDisk = $Inventory.osDisk
+    $dataDisks = @($Inventory.dataDisks)
+    $nics = @($Inventory.nics)
+    $dataDiskRefs = @($vm.storageProfile.dataDisks)
+    $nicRefs = @($vm.networkProfile.networkInterfaces)
+
+    $osDiskSizeGB = ConvertTo-IntOrNull -Value $osDisk.diskSizeGB
+    $osDiskSizeMB = if ($null -ne $osDiskSizeGB) { $osDiskSizeGB * 1024 } else { $null }
+    $hyperVGeneration = if ($osDisk -and $osDisk.hyperVGeneration) { [string]$osDisk.hyperVGeneration } else { $null }
+    if ([string]::IsNullOrWhiteSpace($hyperVGeneration) -and $vm.securityProfile -and $vm.securityProfile.securityType -eq 'TrustedLaunch') {
+        $hyperVGeneration = 'V2'
+    }
+
+    $usesPremiumStorage = (Test-DiskUsesPremiumStorage -Disk $osDisk)
+    $usesUltraStorage = ($vm.additionalCapabilities -and $vm.additionalCapabilities.ultraSsdEnabled -eq $true)
+    foreach ($disk in $dataDisks) {
+        if (Test-DiskUsesPremiumStorage -Disk $disk) {
+            $usesPremiumStorage = $true
+        }
+        if (Test-DiskUsesUltraStorage -Disk $disk) {
+            $usesUltraStorage = $true
+        }
+    }
+
+    [pscustomobject]@{
+        Architecture                  = Get-SkuArchitecture -Sku $SourceSku
+        DataDiskCount                 = $dataDiskRefs.Count
+        NicCount                      = $nicRefs.Count
+        RequiresAcceleratedNetworking = (@($nics | Where-Object { $_.enableAcceleratedNetworking -eq $true }).Count -gt 0)
+        RequiresPremiumStorage        = [bool]$usesPremiumStorage
+        RequiresUltraStorage          = [bool]$usesUltraStorage
+        RequiresEncryptionAtHost      = ($vm.securityProfile -and $vm.securityProfile.encryptionAtHost -eq $true)
+        HyperVGeneration              = $hyperVGeneration
+        OsDiskSizeMB                  = $osDiskSizeMB
+    }
+}
+
+function Get-SkuRequirementFailures {
+    param(
+        $Sku,
+        $Requirements
+    )
+
+    $failures = @()
+
+    if ($Requirements.Architecture) {
+        $candidateArchitecture = Get-SkuArchitecture -Sku $Sku
+        if ($candidateArchitecture -and $candidateArchitecture -ne $Requirements.Architecture) {
+            $failures += "architecture $candidateArchitecture does not match source $($Requirements.Architecture)"
+        }
+    }
+
+    $maxDataDiskCount = ConvertTo-IntOrNull -Value (Get-SkuCapabilityValue -Sku $Sku -Name 'MaxDataDiskCount')
+    if ($null -ne $maxDataDiskCount -and $maxDataDiskCount -lt $Requirements.DataDiskCount) {
+        $failures += "supports $maxDataDiskCount data disk(s), source has $($Requirements.DataDiskCount)"
+    }
+
+    $maxNetworkInterfaces = ConvertTo-IntOrNull -Value (Get-SkuCapabilityValue -Sku $Sku -Name 'MaxNetworkInterfaces')
+    if ($null -ne $maxNetworkInterfaces -and $maxNetworkInterfaces -lt $Requirements.NicCount) {
+        $failures += "supports $maxNetworkInterfaces NIC(s), source has $($Requirements.NicCount)"
+    }
+
+    $maxOsVhdSizeMB = ConvertTo-IntOrNull -Value (Get-SkuCapabilityValue -Sku $Sku -Name 'OSVhdSizeMB')
+    if ($null -ne $Requirements.OsDiskSizeMB -and $null -ne $maxOsVhdSizeMB -and $maxOsVhdSizeMB -lt $Requirements.OsDiskSizeMB) {
+        $failures += "OS disk limit is $maxOsVhdSizeMB MB, source OS disk is $($Requirements.OsDiskSizeMB) MB"
+    }
+
+    if ($Requirements.RequiresAcceleratedNetworking -and (Get-SkuBoolCapability -Sku $Sku -Name 'AcceleratedNetworkingEnabled') -eq $false) {
+        $failures += 'does not support accelerated networking used by source NICs'
+    }
+
+    if ($Requirements.RequiresPremiumStorage -and (Get-SkuBoolCapability -Sku $Sku -Name 'PremiumIO') -eq $false) {
+        $failures += 'does not support Premium disk storage used by source disks'
+    }
+
+    if ($Requirements.RequiresUltraStorage -and (Get-SkuBoolCapability -Sku $Sku -Name 'UltraSSDAvailable') -eq $false) {
+        $failures += 'does not support Ultra SSD used by source disks or VM capabilities'
+    }
+
+    if ($Requirements.RequiresEncryptionAtHost -and (Get-SkuBoolCapability -Sku $Sku -Name 'EncryptionAtHostSupported') -eq $false) {
+        $failures += 'does not support encryption at host used by source VM'
+    }
+
+    if (-not (Test-SkuSupportsHyperVGeneration -Sku $Sku -Generation $Requirements.HyperVGeneration)) {
+        $failures += "does not support Hyper-V generation $($Requirements.HyperVGeneration)"
+    }
+
+    return $failures
+}
+
+function Get-SourceCompatibleSkus {
+    param(
+        [object[]]$Skus,
+        $Requirements
+    )
+
+    $compatible = @()
+    $failureCounts = @{}
+    foreach ($sku in @($Skus)) {
+        $failures = @(Get-SkuRequirementFailures -Sku $sku -Requirements $Requirements)
+        if ($failures.Count -eq 0) {
+            $compatible += $sku
+            continue
+        }
+
+        foreach ($failure in $failures) {
+            if (-not $failureCounts.ContainsKey($failure)) {
+                $failureCounts[$failure] = 0
+            }
+            $failureCounts[$failure]++
+        }
+    }
+
+    $hiddenCount = @($Skus).Count - $compatible.Count
+    if ($hiddenCount -gt 0) {
+        Write-WarningLine "Hid $hiddenCount SKU option(s) that do not match source VM attachment or platform requirements."
+        foreach ($reason in ($failureCounts.Keys | Sort-Object)) {
+            Write-WarningLine "  $($failureCounts[$reason]) hidden: $reason"
+        }
+    }
+
+    return $compatible
 }
 
 function Get-QuotaEligibleSkus {
@@ -1155,7 +1557,7 @@ function Get-QuotaEligibleSkus {
     $unknownCount = 0
 
     foreach ($sku in @($Skus)) {
-        if (-not (Test-SkuUnrestricted -Sku $sku)) {
+        if (-not (Test-SkuUnrestricted -Sku $sku -SourceVm $SourceVm)) {
             continue
         }
 
@@ -1544,6 +1946,7 @@ function Select-Direction {
 function Select-TargetSku {
     param(
         $Vm,
+        $Inventory,
         [string]$ResolvedDirection
     )
 
@@ -1560,7 +1963,36 @@ function Select-TargetSku {
         'Browse unrestricted, quota-eligible VM SKUs in this region.'
     }
 
-    $allSkus = @(Get-SkuCatalog -Location $Vm.location)
+    $regionalSizes = @(Get-RegionalVmSizes -Location $Vm.location)
+    $sourceSize = @($regionalSizes | Where-Object { $_.name -eq $currentSize } | Select-Object -First 1)
+    if ($sourceSize.Count -gt 0) {
+        $sourceSize = $sourceSize[0]
+    }
+    else {
+        Write-WarningLine "Could not find source size '$currentSize' in the lightweight VM size list. Target CPU/RAM defaults may be unavailable."
+        $sourceSize = $null
+    }
+
+    if (-not $NonInteractive) {
+        Write-Section 'Target hardware shape'
+        Write-Host ("Current size: {0}" -f $currentSize)
+        if ($sourceSize) {
+            $sourceMemoryGB = Convert-MemoryMBToGB -MemoryMB $sourceSize.memoryInMB
+            Write-Host ("Current shape: {0} vCPU / {1} GiB RAM" -f $sourceSize.numberOfCores, (Format-MemoryGB -MemoryGB $sourceMemoryGB))
+        }
+    }
+
+    $targetShape = Read-TargetHardwareShape -CurrentSize $currentSize -SourceSize $sourceSize
+    $candidateSizeNames = @(Get-CandidateVmSizeNames -Sizes $regionalSizes -Cores $targetShape.Cores -MemoryMB $targetShape.MemoryMB)
+    if ($candidateSizeNames.Count -eq 0) {
+        Write-WarningLine "No VM sizes in $($Vm.location) exactly matched $($targetShape.Cores) vCPU / $(Format-MemoryGB -MemoryGB $targetShape.MemoryGB) GiB RAM. Falling back to manual entry."
+        return (Read-RequiredText -Prompt 'Target VM size' -ExistingValue $null)
+    }
+
+    Write-Info "Found $($candidateSizeNames.Count) VM size name(s) with the exact target shape before SKU metadata lookup."
+
+    $catalogSizeNames = @($candidateSizeNames + @($currentSize) | Sort-Object -Unique)
+    $allSkus = @(Get-SkuCatalog -Location $Vm.location -SizeNames $catalogSizeNames)
     $quotaUsages = @(Get-QuotaUsage -Location $Vm.location -SubscriptionId (Get-SubscriptionIdFromId -Id $Vm.id))
     $sourceSku = @($allSkus | Where-Object { $_.name -eq $currentSize } | Select-Object -First 1)
     if ($sourceSku.Count -eq 0) {
@@ -1575,7 +2007,27 @@ function Select-TargetSku {
         $sourceSku = $sourceSku[0]
     }
 
-    $eligibleSkus = @(Get-QuotaEligibleSkus -Skus $allSkus -Usages $quotaUsages -ResolvedDirection $ResolvedDirection -SourceSku $sourceSku -SourceVm $Vm)
+    $sourceRequirements = Get-SourceSkuRequirements -Inventory $Inventory -SourceSku $sourceSku
+    if ($sourceRequirements.Architecture) {
+        Write-Info "Source architecture: $($sourceRequirements.Architecture). Candidate SKUs must match when Azure reports architecture."
+    }
+    if ($sourceRequirements.DataDiskCount -gt 0) {
+        Write-Info "Source has $($sourceRequirements.DataDiskCount) attached data disk(s). Candidate SKUs must support at least that many."
+    }
+    if ($sourceRequirements.NicCount -gt 1) {
+        Write-Info "Source has $($sourceRequirements.NicCount) NIC(s). Candidate SKUs must support at least that many."
+    }
+    if ($sourceRequirements.RequiresAcceleratedNetworking) {
+        Write-Info 'Source NICs use accelerated networking. Candidate SKUs must support it.'
+    }
+
+    $candidateNameLookup = @{}
+    foreach ($candidateName in $candidateSizeNames) {
+        $candidateNameLookup[$candidateName] = $true
+    }
+    $targetSkus = @($allSkus | Where-Object { $candidateNameLookup.ContainsKey($_.name) })
+    $targetSkus = @(Get-SourceCompatibleSkus -Skus $targetSkus -Requirements $sourceRequirements)
+    $eligibleSkus = @(Get-QuotaEligibleSkus -Skus $targetSkus -Usages $quotaUsages -ResolvedDirection $ResolvedDirection -SourceSku $sourceSku -SourceVm $Vm)
     $currentEligible = @($eligibleSkus | Where-Object { $_.name -eq $currentSize } | Select-Object -First 1)
     $recommendedSku = @($eligibleSkus | Select-Object -First 1)
 
@@ -1844,7 +2296,7 @@ function Select-Decisions {
 
     $vm = $Inventory.vm
     $availabilitySetAction = Resolve-AvailabilitySetAction -Vm $vm -ResolvedDirection $ResolvedDirection
-    $targetSkuValue = Select-TargetSku -Vm $vm -ResolvedDirection $ResolvedDirection
+    $targetSkuValue = Select-TargetSku -Vm $vm -Inventory $Inventory -ResolvedDirection $ResolvedDirection
     if (Resolve-SkuValidation) {
         Test-TargetSku -Location $vm.location -Size $targetSkuValue -ResolvedDirection $ResolvedDirection
     }
