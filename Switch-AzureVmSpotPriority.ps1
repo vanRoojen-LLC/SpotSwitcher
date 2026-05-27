@@ -1419,7 +1419,7 @@ function Get-SkuCatalog {
     }
 
     Write-Info $description
-    Write-WarningLine 'The SKU metadata lookup is the slower Azure call. SpotSwitcher will print progress every 5 seconds if Azure CLI stalls.'
+    Write-WarningLine 'The SKU metadata lookup is the slower Azure call. SpotSwitcher will print progress every 30 seconds if Azure CLI stalls.'
     return @(Invoke-AzJson -Arguments @(
             'vm', 'list-skus',
             '--location', $Location,
