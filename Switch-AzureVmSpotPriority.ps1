@@ -160,26 +160,151 @@ function Format-AzCommand {
     return 'az ' + ($escaped -join ' ')
 }
 
+function Invoke-AzProcessWithTimeout {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+        [Parameter(Mandatory = $true)]
+        [int]$TimeoutSeconds,
+        [string]$Description,
+        [int]$ProgressIntervalSeconds = 5,
+        [switch]$EnableQuietDynamicExtensionInstall
+    )
+
+    if ($Description) {
+        Write-Info $Description
+    }
+    Write-Info "Running: $(Format-AzCommand $Arguments)"
+    Write-Info "Timeout: $TimeoutSeconds seconds."
+    if ($EnableQuietDynamicExtensionInstall) {
+        Write-Info 'Azure CLI dynamic extension install is enabled without prompt for this command.'
+    }
+
+    $psi = [System.Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = 'az'
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    foreach ($arg in $Arguments) {
+        [void]$psi.ArgumentList.Add($arg)
+    }
+
+    if ($EnableQuietDynamicExtensionInstall) {
+        $psi.Environment['AZURE_EXTENSION_USE_DYNAMIC_INSTALL'] = 'yes_without_prompt'
+    }
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $psi
+    try {
+        [void]$process.Start()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+
+        $deadline = [DateTimeOffset]::Now.AddSeconds([math]::Max(1, $TimeoutSeconds))
+        $lastProgressAt = [DateTimeOffset]::Now
+        $exited = $false
+        while ([DateTimeOffset]::Now -lt $deadline) {
+            if ($process.WaitForExit(1000)) {
+                $exited = $true
+                break
+            }
+
+            $elapsedSeconds = [int]([DateTimeOffset]::Now - $lastProgressAt).TotalSeconds
+            if ($ProgressIntervalSeconds -gt 0 -and $elapsedSeconds -ge $ProgressIntervalSeconds) {
+                $totalElapsedSeconds = [int]([DateTimeOffset]::Now - ($deadline.AddSeconds(-1 * [math]::Max(1, $TimeoutSeconds)))).TotalSeconds
+                Write-WarningLine "Still waiting on Azure CLI after $totalElapsedSeconds seconds: $(Format-AzCommand $Arguments)"
+                $lastProgressAt = [DateTimeOffset]::Now
+            }
+        }
+
+        if (-not $exited) {
+            try {
+                $process.Kill($true)
+            }
+            catch {
+                try {
+                    $process.Kill()
+                }
+                catch {
+                    # Best-effort process cleanup before surfacing timeout.
+                }
+            }
+            try {
+                [void]$process.WaitForExit(5000)
+            }
+            catch {
+            }
+
+            $partialStdOut = ''
+            $partialStdErr = ''
+            try {
+                $partialStdOut = $stdoutTask.GetAwaiter().GetResult()
+            }
+            catch {
+            }
+            try {
+                $partialStdErr = $stderrTask.GetAwaiter().GetResult()
+            }
+            catch {
+            }
+
+            $partialText = (($partialStdOut, $partialStdErr) -join "`n").Trim()
+            if (-not [string]::IsNullOrWhiteSpace($partialText)) {
+                Write-WarningLine "Azure CLI output before timeout:`n$partialText"
+            }
+
+            throw "Azure CLI command timed out after $TimeoutSeconds seconds: $(Format-AzCommand $Arguments)"
+        }
+
+        [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            StdOut   = $stdoutTask.GetAwaiter().GetResult()
+            StdErr   = $stderrTask.GetAwaiter().GetResult()
+        }
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 function Invoke-AzJson {
     param(
         [Parameter(Mandatory = $true)]
         [string[]]$Arguments,
-        [switch]$AllowEmpty
+        [switch]$AllowEmpty,
+        [int]$TimeoutSeconds = 0,
+        [string]$Description,
+        [switch]$EnableQuietDynamicExtensionInstall
     )
 
-    $output = & az @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
-    $text = ($output | Out-String).Trim()
+    if ($TimeoutSeconds -gt 0) {
+        $result = Invoke-AzProcessWithTimeout -Arguments $Arguments -TimeoutSeconds $TimeoutSeconds -Description $Description -EnableQuietDynamicExtensionInstall:$EnableQuietDynamicExtensionInstall
+        $exitCode = $result.ExitCode
+        $text = ([string]$result.StdOut).Trim()
+        $diagnosticText = ([string]$result.StdErr).Trim()
+    }
+    else {
+        if ($Description) {
+            Write-Info $Description
+        }
+        $output = & az @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+        $text = ($output | Out-String).Trim()
+        $diagnosticText = $text
+    }
 
     if ($exitCode -ne 0) {
-        throw "Azure CLI command failed: $(Format-AzCommand $Arguments)`n$text"
+        $details = if ([string]::IsNullOrWhiteSpace($diagnosticText)) { $text } else { $diagnosticText }
+        throw "Azure CLI command failed: $(Format-AzCommand $Arguments)`n$details"
     }
 
     if ([string]::IsNullOrWhiteSpace($text)) {
         if ($AllowEmpty) {
             return $null
         }
-        throw "Azure CLI command returned no JSON: $(Format-AzCommand $Arguments)"
+        $details = if ([string]::IsNullOrWhiteSpace($diagnosticText)) { '' } else { "`n$diagnosticText" }
+        throw "Azure CLI command returned no JSON: $(Format-AzCommand $Arguments)$details"
     }
 
     return ($text | ConvertFrom-Json -Depth 100)
@@ -779,14 +904,17 @@ function Get-QuotaUsage {
     )
 
     Write-Info "Reading regional quota usage for $Location."
-    Write-WarningLine 'Quota lookup is read-only but can take 10-30 seconds in Cloud Shell. The first run may install the Azure CLI quota extension.'
+    $quotaApiTimeoutSeconds = 45
+    $legacyQuotaTimeoutSeconds = 30
+    Write-WarningLine "Quota lookup is read-only. SpotSwitcher gives the Azure Quota API $quotaApiTimeoutSeconds seconds before falling back to legacy compute usage."
+    Write-WarningLine 'If this is the first quota run in Cloud Shell, Azure CLI may install the quota extension non-interactively.'
     $records = @()
 
     if ($SubscriptionId) {
         $scope = "/subscriptions/$SubscriptionId/providers/Microsoft.Compute/locations/$Location"
         try {
-            $usageResult = Invoke-AzJson -Arguments @('quota', 'usage', 'list', '--scope', $scope, '-o', 'json')
-            $limitResult = Invoke-AzJson -Arguments @('quota', 'list', '--scope', $scope, '-o', 'json')
+            $usageResult = Invoke-AzJson -Arguments @('quota', 'usage', 'list', '--scope', $scope, '-o', 'json') -TimeoutSeconds $quotaApiTimeoutSeconds -Description 'Quota API step 1 of 2: reading current quota usage.' -EnableQuietDynamicExtensionInstall
+            $limitResult = Invoke-AzJson -Arguments @('quota', 'list', '--scope', $scope, '-o', 'json') -TimeoutSeconds $quotaApiTimeoutSeconds -Description 'Quota API step 2 of 2: reading quota limits.' -EnableQuietDynamicExtensionInstall
             $records = @(Convert-QuotaExtensionUsage -UsageResult $usageResult -LimitResult $limitResult)
             if ($records.Count -gt 0) {
                 Write-Info "Quota API returned $($records.Count) compute quota rows."
@@ -804,7 +932,8 @@ function Get-QuotaUsage {
     }
 
     try {
-        $legacyUsage = Invoke-AzJson -Arguments @('vm', 'list-usage', '--location', $Location, '-o', 'json')
+        Write-WarningLine "Trying legacy compute usage with a $legacyQuotaTimeoutSeconds second timeout."
+        $legacyUsage = Invoke-AzJson -Arguments @('vm', 'list-usage', '--location', $Location, '-o', 'json') -TimeoutSeconds $legacyQuotaTimeoutSeconds -Description 'Legacy quota fallback: reading compute usage.'
         $records = @(Convert-ComputeUsage -UsageResult $legacyUsage)
         if ($records.Count -gt 0) {
             Write-WarningLine 'Legacy compute usage usually reports regional/family vCPU quota but may not expose Spot quota.'
