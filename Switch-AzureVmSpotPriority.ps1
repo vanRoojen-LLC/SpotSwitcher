@@ -185,7 +185,7 @@ function Invoke-AzProcessWithTimeout {
         [Parameter(Mandatory = $true)]
         [int]$TimeoutSeconds,
         [string]$Description,
-        [int]$ProgressIntervalSeconds = 5,
+        [int]$ProgressIntervalSeconds = 30,
         [switch]$EnableQuietDynamicExtensionInstall
     )
 
@@ -231,7 +231,7 @@ function Invoke-AzProcessWithTimeout {
             $elapsedSeconds = [int]([DateTimeOffset]::Now - $lastProgressAt).TotalSeconds
             if ($ProgressIntervalSeconds -gt 0 -and $elapsedSeconds -ge $ProgressIntervalSeconds) {
                 $totalElapsedSeconds = [int]([DateTimeOffset]::Now - ($deadline.AddSeconds(-1 * [math]::Max(1, $TimeoutSeconds)))).TotalSeconds
-                Write-WarningLine "Still waiting on Azure CLI after $totalElapsedSeconds seconds: $(Format-AzCommand $Arguments)"
+                Write-Info "Still waiting on Azure CLI after $totalElapsedSeconds seconds."
                 $lastProgressAt = [DateTimeOffset]::Now
             }
         }
