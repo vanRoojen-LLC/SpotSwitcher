@@ -156,6 +156,8 @@ Safety defaults:
   - Execute mode sets OS disk, data disks, and NIC deleteOption to Detach.
   - Dynamic private IPs can be pinned to static before wrapper deletion.
   - Incremental snapshots can be created after deallocation.
+  - Source VM tags are captured in the saved plan and reapplied to the recreated
+    VM. Tags on existing disks and NICs remain on those resources.
   - Stable source power states are restored after recreation: running remains
     running, stopped is stopped, and deallocated is deallocated.
   - Transitional source power states are waited on until the VM reaches a stable
@@ -810,18 +812,69 @@ function Get-PlanRoot {
     return (Join-Path (Get-Location) 'SpotSwitcherPlans')
 }
 
+function ConvertTo-TagPairs {
+    param($Tags)
+
+    $pairs = @()
+    if ($null -eq $Tags) {
+        return $pairs
+    }
+
+    if ($Tags -is [System.Collections.IDictionary]) {
+        foreach ($key in @($Tags.Keys | Sort-Object)) {
+            if ($null -ne $Tags[$key]) {
+                $pairs += [pscustomobject]@{
+                    Name  = [string]$key
+                    Value = [string]$Tags[$key]
+                }
+            }
+        }
+        return $pairs
+    }
+
+    foreach ($prop in @($Tags.PSObject.Properties | Sort-Object Name)) {
+        if ($null -ne $prop.Value) {
+            $pairs += [pscustomobject]@{
+                Name  = [string]$prop.Name
+                Value = [string]$prop.Value
+            }
+        }
+    }
+
+    return $pairs
+}
+
+function ConvertTo-TagObject {
+    param($Tags)
+
+    $tagObject = [ordered]@{}
+    foreach ($tag in @(ConvertTo-TagPairs -Tags $Tags)) {
+        $tagObject[$tag.Name] = $tag.Value
+    }
+
+    return [pscustomobject]$tagObject
+}
+
+function Get-PlanSourceTags {
+    param($Plan)
+
+    if ($Plan.source -is [System.Collections.IDictionary] -and $Plan.source.Contains('tags')) {
+        return $Plan.source['tags']
+    }
+
+    if ($Plan.source.PSObject.Properties['tags']) {
+        return $Plan.source.tags
+    }
+
+    return $Plan.source.vm.tags
+}
+
 function Get-TagsAsArguments {
     param($Tags)
 
     $tagArgs = @()
-    if ($null -eq $Tags) {
-        return $tagArgs
-    }
-
-    foreach ($prop in $Tags.PSObject.Properties) {
-        if ($null -ne $prop.Value) {
-            $tagArgs += "$($prop.Name)=$($prop.Value)"
-        }
+    foreach ($tag in @(ConvertTo-TagPairs -Tags $Tags)) {
+        $tagArgs += "$($tag.Name)=$($tag.Value)"
     }
 
     return $tagArgs
@@ -2228,6 +2281,7 @@ function Show-InventorySummary {
     Write-Host ("Priority:    {0}" -f $priority)
     Write-Host ("Size:        {0}" -f $vm.hardwareProfile.vmSize)
     Write-Host ("OS:          {0}" -f $vm.storageProfile.osDisk.osType)
+    Write-Host ("VM tags:     {0}" -f @(ConvertTo-TagPairs -Tags $vm.tags).Count)
     Write-Host ("OS disk:     {0}" -f $vm.storageProfile.osDisk.managedDisk.id)
     Write-Host ("OS delete:   {0}" -f $vm.storageProfile.osDisk.deleteOption)
     Write-Host ("NIC count:   {0}" -f @($Inventory.nics).Count)
@@ -2264,6 +2318,10 @@ function Show-InventorySummary {
 
     if (@($Inventory.extensions).Count -gt 0) {
         Write-WarningLine 'VM extensions are inventoried but not automatically reinstalled because protected settings are not recoverable from Azure.'
+    }
+
+    if ($vm.identity -and [string]$vm.identity.type -like '*SystemAssigned*') {
+        Write-WarningLine 'System-assigned managed identity can be re-enabled, but Azure creates a new principal ID after the VM wrapper is recreated.'
     }
 }
 
@@ -2768,7 +2826,7 @@ function New-Plan {
     $sourcePowerStateCode = Get-VmPowerStateCode -InstanceView $Inventory.instanceView
 
     [ordered]@{
-        planVersion = 3
+        planVersion = 4
         generatedAt = (Get-Date).ToString('o')
         planId = "$($vm.name)-$($Decisions.direction)-$stamp"
         subscription = @{
@@ -2778,6 +2836,7 @@ function New-Plan {
         }
         source = @{
             vm = $Inventory.vm
+            tags = ConvertTo-TagObject -Tags $Inventory.vm.tags
             instanceView = $Inventory.instanceView
             extensions = $Inventory.extensions
             nics = $Inventory.nics
@@ -2882,7 +2941,7 @@ function Get-CreateVmArgs {
         $args += @('--ultra-ssd-enabled', 'true')
     }
 
-    $tagArgs = @(Get-TagsAsArguments -Tags $vm.tags)
+    $tagArgs = @(Get-TagsAsArguments -Tags (Get-PlanSourceTags -Plan $Plan))
     if ($tagArgs.Count -gt 0) {
         $args += '--tags'
         $args += $tagArgs
@@ -3189,6 +3248,7 @@ function Show-DecisionSummary {
     Write-Section 'Decision summary'
     Write-Host ("Direction:        {0}" -f $Plan.decisions.direction)
     Write-Host ("Target SKU:       {0}" -f $Plan.decisions.targetSku)
+    Write-Host ("VM tags:          Preserve {0} source tag(s)" -f @(ConvertTo-TagPairs -Tags (Get-PlanSourceTags -Plan $Plan)).Count)
     Write-Host ("Original power:   {0}" -f $Plan.source.powerState.displayStatus)
     Write-Host ("Final power:      {0}" -f $Plan.source.powerState.restoreSummary)
     if ($Plan.decisions.direction -eq 'ToSpot') {

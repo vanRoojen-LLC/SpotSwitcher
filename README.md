@@ -26,6 +26,9 @@ execute and pass the final exact confirmation prompt.
 During conversion, SpotSwitcher records the source VM power state and restores
 stable states after recreation: running VMs remain running, stopped VMs are
 stopped again, and deallocated VMs are deallocated again.
+It also captures the source VM tags in the saved plan and reapplies them to the
+recreated VM. Existing disk and NIC tags remain on those resources because
+SpotSwitcher preserves the original managed disks and NICs.
 If Azure reports a transitional source state such as starting or deallocating,
 SpotSwitcher warns and waits until the VM reaches a stable state before planning
 the conversion.
@@ -107,6 +110,32 @@ Azure Spot VMs cannot be created in availability sets. If a source VM is in an
 availability set, SpotSwitcher prompts before intentionally dropping that
 membership for a Spot conversion. In unattended mode, pass
 `-DropAvailabilitySetForSpot Yes` to make that choice explicit.
+
+## Preservation Notes
+
+SpotSwitcher preserves the source VM tags, managed OS disk, managed data disks,
+NICs, primary NIC ordering, optional static private IP pinning, selected VM
+size, zones, Proximity Placement Group, license type, Trusted Launch settings,
+Ultra SSD capability, boot diagnostics, user-assigned identities, and the
+stable source power state where Azure CLI can safely reapply them.
+
+Known Azure recreation gaps to review before execution:
+
+- VM extensions are listed for review, but protected settings cannot be read
+  back from Azure, so extensions are not automatically reinstalled.
+- A system-assigned managed identity can be re-enabled, but Azure creates a new
+  principal ID. Any RBAC assignments, Key Vault access policies, or app
+  allow-lists tied to the old principal may need repair.
+- Availability-set membership must be dropped when converting to Spot because
+  Azure Spot VMs do not support availability sets.
+- VM-scoped diagnostic settings, backup/protection associations, maintenance
+  configuration assignments, locks, policy exemptions, or other extension
+  resources that are attached to the VM wrapper should be checked after
+  recreation.
+- Dedicated host, capacity reservation, VM applications, secrets/certificates
+  injected through `osProfile`, or other less common VM wrapper settings should
+  be treated as review items until SpotSwitcher explicitly inventories and
+  restores them.
 
 ## Product and Support
 
