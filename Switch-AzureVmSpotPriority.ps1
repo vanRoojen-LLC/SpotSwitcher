@@ -1014,6 +1014,16 @@ function Get-DirectScopeLocks {
         })
 }
 
+function Get-ResourceLockListArguments {
+    param([string]$ResourceId)
+
+    @(
+        'lock', 'list',
+        '--resource', $ResourceId,
+        '-o', 'json'
+    )
+}
+
 function Get-PlanSourceCollection {
     param(
         $Plan,
@@ -2933,8 +2943,8 @@ function Get-VmInventory {
     $instanceView = Invoke-AzJson -Arguments @('vm', 'get-instance-view', '-g', $ResourceGroup, '-n', $Name, '-o', 'json')
     $extensions = @(Invoke-AzJson -Arguments @('vm', 'extension', 'list', '-g', $ResourceGroup, '--vm-name', $Name, '-o', 'json'))
     $vmLocksRaw = @(Invoke-AzJsonOptional `
-            -Arguments @('lock', 'list', '--scope', $vm.id, '-o', 'json') `
-            -Description 'Reading direct VM management locks.' `
+            -Arguments (Get-ResourceLockListArguments -ResourceId $vm.id) `
+            -Description 'Reading VM management locks, including inherited subscription or resource-group locks.' `
             -WarningLabel 'VM lock inventory')
     $vmLocks = @(Get-DirectScopeLocks -Locks $vmLocksRaw -ScopeId $vm.id)
     $diagnosticSettings = @(Invoke-AzJsonOptional `
