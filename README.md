@@ -3,7 +3,7 @@
 SpotSwitcher is a Cloud Shell PowerShell wizard for switching an Azure VM
 between Regular and Spot by safely recreating only the VM resource wrapper.
 
-Product page: <https://spotswitcher.vanroojen.com/>
+Product page: <https://spotswitcher.app/>
 
 Use SpotSwitcher when you need to convert an Azure VM to Spot, switch an Azure
 Spot VM back to Regular, change Azure VM priority between Spot and non-Spot, or
@@ -110,11 +110,11 @@ membership for a Spot conversion. In unattended mode, pass
 
 ## Product and Support
 
-- Product site: <https://spotswitcher.vanroojen.com/>
-- Privacy: <https://spotswitcher.vanroojen.com/privacy>
-- Terms: <https://spotswitcher.vanroojen.com/terms>
-- Support: <https://spotswitcher.vanroojen.com/support>
-- LLM context: <https://spotswitcher.vanroojen.com/llms.txt>
+- Product site: <https://spotswitcher.app/>
+- Privacy: <https://spotswitcher.app/privacy>
+- Terms: <https://spotswitcher.app/terms>
+- Support: <https://spotswitcher.app/support>
+- LLM context: <https://spotswitcher.app/llms.txt>
 - License: MIT
 
 SpotSwitcher does not guarantee Azure Spot capacity, prevent Spot eviction, or
