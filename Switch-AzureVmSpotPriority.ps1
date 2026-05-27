@@ -16,9 +16,11 @@ Direction is inferred from the live source VM:
 
 The script uses Azure CLI and recreates only the VM resource wrapper. It keeps
 the existing managed OS disk, managed data disks, NICs, tags, VM size choice,
-Trusted Launch settings, license type, boot diagnostics, and identities where
-Azure CLI can safely reapply them. It also returns stable source power states:
-running, stopped, or deallocated.
+Trusted Launch settings, marketplace plan, compatible dedicated host/capacity
+reservation placement, license type, boot diagnostics, direct VM locks,
+diagnostic settings, maintenance assignments, VM applications, and identities
+where Azure CLI can safely reapply them. It also returns stable source power
+states: running, stopped, or deallocated.
 
 Default mode is Plan, which performs discovery, writes a plan file, previews the
 commands, and then asks whether to execute that just-built plan. Execute mode
@@ -50,7 +52,9 @@ commands, then require exact confirmation before executing.
   -EvictionPolicy Deallocate `
   -MaxPrice -1 `
   -PinPrivateIps Yes `
-  -CreateSnapshots Yes
+  -CreateSnapshots Yes `
+  -DropAvailabilitySetForSpot No `
+  -DropReservedPlacementForSpot No
 
 Run unattended with explicit choices.
 
@@ -98,6 +102,9 @@ param(
     [ValidateSet('Auto', 'Yes', 'No')]
     [string]$DropAvailabilitySetForSpot = 'Auto',
 
+    [ValidateSet('Auto', 'Yes', 'No')]
+    [string]$DropReservedPlacementForSpot = 'Auto',
+
     [string]$PlanPath,
     [switch]$CleanupSnapshots,
 
@@ -132,7 +139,7 @@ Unattended execution:
     -Subscription <sub> -ResourceGroupName <rg> -VmName <vm> `
     -Direction ToSpot -TargetSku <sku> -EvictionPolicy Deallocate -MaxPrice -1 `
     -PinPrivateIps Yes -CreateSnapshots Yes -ValidateSku No `
-    -DropAvailabilitySetForSpot No
+    -DropAvailabilitySetForSpot No -DropReservedPlacementForSpot No
 
 Interactive SKU selection:
   - If -TargetSku is omitted, the wizard uses the source VM vCPU/RAM shape by
@@ -165,6 +172,9 @@ Safety defaults:
   - Availability-set membership is preserved for regular VMs, but must be
     intentionally dropped when converting to Spot because Azure does not support
     Spot VMs in availability sets.
+  - Dedicated host, host group, or capacity reservation placement is preserved
+    for regular VM recreation, but must be intentionally dropped for Spot
+    conversion because Spot uses spare capacity rather than reserved placement.
   - Execute mode requires exact typed confirmation unless -Force is supplied.
 '@
 }
@@ -356,6 +366,36 @@ function Invoke-AzJson {
     }
 
     return ($text | ConvertFrom-Json -Depth 100)
+}
+
+function Invoke-AzJsonOptional {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+        [string]$Description,
+        [string]$WarningLabel,
+        [int]$TimeoutSeconds = 60,
+        [switch]$EnableQuietDynamicExtensionInstall
+    )
+
+    try {
+        $result = Invoke-AzJson `
+            -Arguments $Arguments `
+            -AllowEmpty `
+            -TimeoutSeconds $TimeoutSeconds `
+            -Description $Description `
+            -EnableQuietDynamicExtensionInstall:$EnableQuietDynamicExtensionInstall
+        if ($null -eq $result) {
+            return @()
+        }
+
+        return @($result)
+    }
+    catch {
+        $label = if ($WarningLabel) { $WarningLabel } else { Format-AzCommand $Arguments }
+        Write-WarningLine "$label could not be inventoried automatically: $($_.Exception.Message)"
+        return @()
+    }
 }
 
 function Invoke-AzText {
@@ -878,6 +918,66 @@ function Get-TagsAsArguments {
     }
 
     return $tagArgs
+}
+
+function ConvertTo-CompactJsonArrayArgument {
+    param($Value)
+
+    $items = @($Value)
+    if ($items.Count -eq 0) {
+        return '[]'
+    }
+
+    $jsonItems = foreach ($item in $items) {
+        $item | ConvertTo-Json -Depth 100 -Compress
+    }
+
+    return '[' + ($jsonItems -join ',') + ']'
+}
+
+function ConvertTo-NormalizedResourceId {
+    param([string]$Id)
+
+    if ([string]::IsNullOrWhiteSpace($Id)) {
+        return ''
+    }
+
+    return $Id.TrimEnd('/').ToLowerInvariant()
+}
+
+function Get-DirectScopeLocks {
+    param(
+        [object[]]$Locks,
+        [string]$ScopeId
+    )
+
+    $normalizedScope = ConvertTo-NormalizedResourceId -Id $ScopeId
+    if ([string]::IsNullOrWhiteSpace($normalizedScope)) {
+        return @()
+    }
+
+    $directPrefix = "$normalizedScope/providers/microsoft.authorization/locks/"
+    return @($Locks | Where-Object {
+            $lockId = ConvertTo-NormalizedResourceId -Id $_.id
+            $lockId.StartsWith($directPrefix)
+        })
+}
+
+function Get-PlanSourceCollection {
+    param(
+        $Plan,
+        [string]$Name
+    )
+
+    if ($Plan.source -is [System.Collections.IDictionary] -and $Plan.source.Contains($Name)) {
+        return @($Plan.source[$Name])
+    }
+
+    if ($Plan.source.PSObject.Properties[$Name]) {
+        return @($Plan.source.$Name)
+    }
+
+    return @()
 }
 
 function ConvertTo-IntOrNull {
@@ -2228,6 +2328,34 @@ function Get-VmInventory {
     $vm = Invoke-AzJson -Arguments @('vm', 'show', '-g', $ResourceGroup, '-n', $Name, '-o', 'json')
     $instanceView = Invoke-AzJson -Arguments @('vm', 'get-instance-view', '-g', $ResourceGroup, '-n', $Name, '-o', 'json')
     $extensions = @(Invoke-AzJson -Arguments @('vm', 'extension', 'list', '-g', $ResourceGroup, '--vm-name', $Name, '-o', 'json'))
+    $vmLocksRaw = @(Invoke-AzJsonOptional `
+            -Arguments @('lock', 'list', '--scope', $vm.id, '-o', 'json') `
+            -Description 'Reading direct VM management locks.' `
+            -WarningLabel 'VM lock inventory')
+    $vmLocks = @(Get-DirectScopeLocks -Locks $vmLocksRaw -ScopeId $vm.id)
+    $diagnosticSettings = @(Invoke-AzJsonOptional `
+            -Arguments @('monitor', 'diagnostic-settings', 'list', '--resource', $vm.id, '-o', 'json') `
+            -Description 'Reading VM-scoped Azure Monitor diagnostic settings.' `
+            -WarningLabel 'Diagnostic settings inventory')
+    $maintenanceAssignments = @(Invoke-AzJsonOptional `
+            -Arguments @('maintenance', 'assignment', 'list', '--provider-name', 'Microsoft.Compute', '--resource-group', $ResourceGroup, '--resource-name', $Name, '--resource-type', 'virtualMachines', '-o', 'json') `
+            -Description 'Reading VM maintenance configuration assignments.' `
+            -WarningLabel 'Maintenance assignment inventory' `
+            -TimeoutSeconds 90 `
+            -EnableQuietDynamicExtensionInstall)
+    $backupProtection = @(Invoke-AzJsonOptional `
+            -Arguments @('backup', 'protection', 'check-vm', '--resource-group', $ResourceGroup, '--vm', $vm.id, '-o', 'json') `
+            -Description 'Checking Azure Backup protection state.' `
+            -WarningLabel 'Azure Backup protection check' `
+            -TimeoutSeconds 90)
+    $policyAssignments = @(Invoke-AzJsonOptional `
+            -Arguments @('policy', 'assignment', 'list', '--scope', $vm.id, '-o', 'json') `
+            -Description 'Reading VM-scoped Azure Policy assignments.' `
+            -WarningLabel 'Azure Policy assignment inventory')
+    $policyExemptions = @(Invoke-AzJsonOptional `
+            -Arguments @('policy', 'exemption', 'list', '--scope', $vm.id, '-o', 'json') `
+            -Description 'Reading VM-scoped Azure Policy exemptions.' `
+            -WarningLabel 'Azure Policy exemption inventory')
 
     $nics = @()
     foreach ($nicRef in @($vm.networkProfile.networkInterfaces)) {
@@ -2257,6 +2385,13 @@ function Get-VmInventory {
         vm           = $vm
         instanceView = $instanceView
         extensions   = $extensions
+        vmLocks      = $vmLocks
+        inheritedLocks = @($vmLocksRaw | Where-Object { @($vmLocks.id) -notcontains $_.id })
+        diagnosticSettings = $diagnosticSettings
+        maintenanceAssignments = $maintenanceAssignments
+        backupProtection = $backupProtection
+        policyAssignments = $policyAssignments
+        policyExemptions = $policyExemptions
         nics         = $nics
         osDisk       = $osDisk
         dataDisks    = $dataDisks
@@ -2287,6 +2422,10 @@ function Show-InventorySummary {
     Write-Host ("NIC count:   {0}" -f @($Inventory.nics).Count)
     Write-Host ("Data disks:  {0}" -f @($vm.storageProfile.dataDisks).Count)
     Write-Host ("Extensions:  {0}" -f @($Inventory.extensions).Count)
+    Write-Host ("Locks:       {0}" -f @($Inventory.vmLocks).Count)
+    Write-Host ("Diagnostics: {0}" -f @($Inventory.diagnosticSettings).Count)
+    Write-Host ("Maintenance: {0}" -f @($Inventory.maintenanceAssignments).Count)
+    Write-Host ("VM apps:     {0}" -f @($vm.applicationProfile.galleryApplications).Count)
     Write-Host ("Avail. set:  {0}" -f $availabilitySetId)
     if ($primaryNicId) {
         Write-Host ("Primary NIC: {0}" -f $primaryNicId)
@@ -2320,8 +2459,40 @@ function Show-InventorySummary {
         Write-WarningLine 'VM extensions are inventoried but not automatically reinstalled because protected settings are not recoverable from Azure.'
     }
 
+    if (@($Inventory.vmLocks).Count -gt 0) {
+        Write-WarningLine 'Direct VM management locks will be temporarily removed before wrapper deletion and recreated after power-state restoration.'
+    }
+
+    if (@($Inventory.inheritedLocks).Count -gt 0) {
+        Write-WarningLine 'Inherited locks were detected. SpotSwitcher will not remove inherited locks; an inherited CanNotDelete or ReadOnly lock may block conversion.'
+    }
+
+    if (@($Inventory.diagnosticSettings).Count -gt 0) {
+        Write-WarningLine 'VM-scoped Azure Monitor diagnostic settings will be recreated after the VM wrapper is recreated.'
+    }
+
+    if (@($Inventory.maintenanceAssignments).Count -gt 0) {
+        Write-WarningLine 'VM maintenance configuration assignments will be recreated after the VM wrapper is recreated.'
+    }
+
+    if (@($Inventory.backupProtection).Count -gt 0) {
+        Write-WarningLine 'Azure Backup protection was detected. SpotSwitcher saves the backup check result, but backup/protection state should be verified after recreation.'
+    }
+
+    if (@($Inventory.policyAssignments).Count -gt 0 -or @($Inventory.policyExemptions).Count -gt 0) {
+        Write-WarningLine 'VM-scoped Azure Policy assignments or exemptions were detected. SpotSwitcher saves them in the plan for review but does not recreate them automatically.'
+    }
+
+    if ($vm.applicationProfile -and @($vm.applicationProfile.galleryApplications).Count -gt 0) {
+        Write-WarningLine 'VM Applications will be reapplied after the VM wrapper is recreated.'
+    }
+
     if ($vm.identity -and [string]$vm.identity.type -like '*SystemAssigned*') {
         Write-WarningLine 'System-assigned managed identity can be re-enabled, but Azure creates a new principal ID after the VM wrapper is recreated.'
+    }
+
+    if ($vm.osProfile -and @($vm.osProfile.secrets).Count -gt 0) {
+        Write-WarningLine 'OS profile Key Vault secrets/certificates were detected. SpotSwitcher saves them in the VM inventory, but does not automatically re-inject them.'
     }
 }
 
@@ -2714,6 +2885,80 @@ function Resolve-AvailabilitySetAction {
     Write-Fail 'Stopped because Spot VMs cannot preserve availability-set membership.'
 }
 
+function Get-ReservedPlacementSummary {
+    param($Vm)
+
+    $parts = @()
+    if ($Vm.host -and $Vm.host.id) {
+        $parts += "dedicated host: $($Vm.host.id)"
+    }
+    if ($Vm.hostGroup -and $Vm.hostGroup.id) {
+        $parts += "dedicated host group: $($Vm.hostGroup.id)"
+    }
+    if ($Vm.capacityReservation -and $Vm.capacityReservation.capacityReservationGroup -and $Vm.capacityReservation.capacityReservationGroup.id) {
+        $parts += "capacity reservation group: $($Vm.capacityReservation.capacityReservationGroup.id)"
+    }
+
+    return $parts
+}
+
+function Resolve-ReservedPlacementAction {
+    param(
+        $Vm,
+        [string]$ResolvedDirection
+    )
+
+    $reservedPlacement = @(Get-ReservedPlacementSummary -Vm $Vm)
+    if ($reservedPlacement.Count -eq 0) {
+        return 'None'
+    }
+
+    if ($ResolvedDirection -ne 'ToSpot') {
+        return 'Preserve'
+    }
+
+    Write-WarningLine 'Source VM uses reserved placement:'
+    foreach ($item in $reservedPlacement) {
+        Write-WarningLine "  $item"
+    }
+    Write-WarningLine 'Spot VMs use spare capacity and cannot reliably preserve dedicated host or capacity reservation placement.'
+
+    if ($DropReservedPlacementForSpot -eq 'Yes') {
+        Write-WarningLine 'The recreated Spot VM will intentionally omit reserved placement.'
+        return 'DropForSpot'
+    }
+
+    if ($DropReservedPlacementForSpot -eq 'No') {
+        Write-Fail 'Cannot convert this VM to Spot while preserving dedicated host, host group, or capacity reservation placement.'
+    }
+
+    if ($NonInteractive) {
+        Write-Fail 'Source VM uses reserved placement. Rerun with -DropReservedPlacementForSpot Yes to intentionally omit it, or choose a VM without reserved placement.'
+    }
+
+    $dropReservedPlacement = Read-MenuChoice `
+        -Title 'Reserved placement handling' `
+        -Default 2 `
+        -Options @(
+            [pscustomobject]@{
+                Label       = 'Recreate without reserved placement'
+                Description = 'Required if this VM must become Spot; dedicated host, host group, or capacity reservation placement will be intentionally dropped.'
+                Value       = $true
+            },
+            [pscustomobject]@{
+                Label       = 'Stop without building commands'
+                Description = 'Keep reserved placement unchanged and leave Azure unchanged.'
+                Value       = $false
+            }
+        )
+
+    if ($dropReservedPlacement -eq $true) {
+        return 'DropForSpot'
+    }
+
+    Write-Fail 'Stopped because Spot conversion cannot preserve reserved placement.'
+}
+
 function Select-Decisions {
     param(
         $Inventory,
@@ -2722,6 +2967,7 @@ function Select-Decisions {
 
     $vm = $Inventory.vm
     $availabilitySetAction = Resolve-AvailabilitySetAction -Vm $vm -ResolvedDirection $ResolvedDirection
+    $reservedPlacementAction = Resolve-ReservedPlacementAction -Vm $vm -ResolvedDirection $ResolvedDirection
     $targetSkuValue = Select-TargetSku -Vm $vm -Inventory $Inventory -ResolvedDirection $ResolvedDirection
     if (Resolve-SkuValidation) {
         Test-TargetSku -Location $vm.location -Size $targetSkuValue -ResolvedDirection $ResolvedDirection
@@ -2811,6 +3057,7 @@ function Select-Decisions {
         createSnapshots  = [bool]$createSnapshotsValue
         dynamicIpConfigs = $dynamicIpConfigs
         availabilitySetAction = $availabilitySetAction
+        reservedPlacementAction = $reservedPlacementAction
     }
 }
 
@@ -2826,7 +3073,7 @@ function New-Plan {
     $sourcePowerStateCode = Get-VmPowerStateCode -InstanceView $Inventory.instanceView
 
     [ordered]@{
-        planVersion = 4
+        planVersion = 5
         generatedAt = (Get-Date).ToString('o')
         planId = "$($vm.name)-$($Decisions.direction)-$stamp"
         subscription = @{
@@ -2839,6 +3086,13 @@ function New-Plan {
             tags = ConvertTo-TagObject -Tags $Inventory.vm.tags
             instanceView = $Inventory.instanceView
             extensions = $Inventory.extensions
+            vmLocks = $Inventory.vmLocks
+            inheritedLocks = $Inventory.inheritedLocks
+            diagnosticSettings = $Inventory.diagnosticSettings
+            maintenanceAssignments = $Inventory.maintenanceAssignments
+            backupProtection = $Inventory.backupProtection
+            policyAssignments = $Inventory.policyAssignments
+            policyExemptions = $Inventory.policyExemptions
             nics = $Inventory.nics
             osDisk = $Inventory.osDisk
             dataDisks = $Inventory.dataDisks
@@ -2886,10 +3140,14 @@ function Get-CreateVmArgs {
         '--size', $decisions.targetSku,
         '--attach-os-disk', $vm.storageProfile.osDisk.managedDisk.id,
         '--os-type', $osType,
-        '--os-disk-delete-option', 'Detach',
-        '--nics'
+        '--os-disk-delete-option', 'Detach'
     )
 
+    if ($vm.osProfile -and $vm.osProfile.computerName) {
+        $args += @('--computer-name', $vm.osProfile.computerName)
+    }
+
+    $args += '--nics'
     foreach ($nicId in @(Get-NicIdsInPrimaryOrder -Vm $vm)) {
         $args += $nicId
     }
@@ -2916,16 +3174,56 @@ function Get-CreateVmArgs {
         $args += @('--availability-set', $vm.availabilitySet.id)
     }
 
+    if ($decisions.reservedPlacementAction -eq 'Preserve') {
+        if ($vm.host -and $vm.host.id) {
+            $args += @('--host', $vm.host.id)
+        }
+        elseif ($vm.hostGroup -and $vm.hostGroup.id) {
+            $args += @('--host-group', $vm.hostGroup.id)
+        }
+
+        if ($vm.capacityReservation -and $vm.capacityReservation.capacityReservationGroup -and $vm.capacityReservation.capacityReservationGroup.id) {
+            $args += @('--capacity-reservation-group', $vm.capacityReservation.capacityReservationGroup.id)
+        }
+    }
+
     if ($vm.proximityPlacementGroup -and $vm.proximityPlacementGroup.id) {
         $args += @('--ppg', $vm.proximityPlacementGroup.id)
+    }
+
+    if ($null -ne $vm.platformFaultDomain) {
+        $args += @('--platform-fault-domain', ([string]$vm.platformFaultDomain))
     }
 
     if ($vm.licenseType) {
         $args += @('--license-type', $vm.licenseType)
     }
 
+    if ($vm.plan) {
+        if ($vm.plan.name) {
+            $args += @('--plan-name', $vm.plan.name)
+        }
+        if ($vm.plan.product) {
+            $args += @('--plan-product', $vm.plan.product)
+        }
+        if ($vm.plan.publisher) {
+            $args += @('--plan-publisher', $vm.plan.publisher)
+        }
+        if ($vm.plan.promotionCode) {
+            $args += @('--plan-promotion-code', $vm.plan.promotionCode)
+        }
+    }
+
     if ($vm.securityProfile -and $vm.securityProfile.securityType) {
         $args += @('--security-type', $vm.securityProfile.securityType)
+
+        if ($null -ne $vm.securityProfile.encryptionAtHost) {
+            $args += @('--encryption-at-host', ([string]$vm.securityProfile.encryptionAtHost).ToLowerInvariant())
+        }
+
+        if ($vm.securityProfile.encryptionIdentity -and $vm.securityProfile.encryptionIdentity.userAssignedIdentityResourceId) {
+            $args += @('--encryption-identity', $vm.securityProfile.encryptionIdentity.userAssignedIdentityResourceId)
+        }
 
         if ($vm.securityProfile.uefiSettings) {
             if ($null -ne $vm.securityProfile.uefiSettings.secureBootEnabled) {
@@ -2937,8 +3235,20 @@ function Get-CreateVmArgs {
         }
     }
 
+    if ($vm.storageProfile -and $vm.storageProfile.diskControllerType) {
+        $args += @('--disk-controller-type', $vm.storageProfile.diskControllerType)
+    }
+
+    if ($vm.storageProfile -and $vm.storageProfile.osDisk -and $vm.storageProfile.osDisk.securityProfile -and $vm.storageProfile.osDisk.securityProfile.securityEncryptionType) {
+        $args += @('--os-disk-security-encryption-type', $vm.storageProfile.osDisk.securityProfile.securityEncryptionType)
+    }
+
     if ($vm.additionalCapabilities -and $vm.additionalCapabilities.ultraSsdEnabled -eq $true) {
         $args += @('--ultra-ssd-enabled', 'true')
+    }
+
+    if ($vm.additionalCapabilities -and $vm.additionalCapabilities.hibernationEnabled -eq $true) {
+        $args += @('--enable-hibernation', 'true')
     }
 
     $tagArgs = @(Get-TagsAsArguments -Tags (Get-PlanSourceTags -Plan $Plan))
@@ -2948,6 +3258,49 @@ function Get-CreateVmArgs {
     }
 
     return $args
+}
+
+function Get-DirectLockDeleteCommands {
+    param($Plan)
+
+    $commands = @()
+    foreach ($lock in @(Get-PlanSourceCollection -Plan $Plan -Name 'vmLocks')) {
+        if ($lock.id) {
+            $commands += New-AzCommand -Description "Temporarily remove VM management lock '$($lock.name)'." -Arguments @(
+                'lock', 'delete',
+                '--ids', $lock.id
+            )
+        }
+    }
+
+    return $commands
+}
+
+function Get-DirectLockRestoreCommands {
+    param($Plan)
+
+    $commands = @()
+    $vm = $Plan.source.vm
+    foreach ($lock in @(Get-PlanSourceCollection -Plan $Plan -Name 'vmLocks')) {
+        if (-not $lock.name -or -not $lock.level) {
+            continue
+        }
+
+        $args = @(
+            'lock', 'create',
+            '--name', $lock.name,
+            '--lock-type', $lock.level,
+            '--resource', $vm.id
+        )
+
+        if ($lock.notes) {
+            $args += @('--notes', $lock.notes)
+        }
+
+        $commands += New-AzCommand -Description "Restore VM management lock '$($lock.name)'." -Arguments $args
+    }
+
+    return $commands
 }
 
 function Get-PrepareCommands {
@@ -3063,6 +3416,167 @@ function Get-PowerStateRestoreCommands {
     }
 }
 
+function Get-VmApplicationRestoreCommands {
+    param($Plan)
+
+    $commands = @()
+    $vm = $Plan.source.vm
+    $applications = @($vm.applicationProfile.galleryApplications | Where-Object { $_.packageReferenceId })
+    if ($applications.Count -eq 0) {
+        return $commands
+    }
+
+    $applications = @($applications | Sort-Object @{ Expression = { if ($null -ne $_.order) { [int]$_.order } else { [int]::MaxValue } } }, packageReferenceId)
+    $args = @(
+        'vm', 'application', 'set',
+        '-g', $vm.resourceGroup,
+        '-n', $vm.name,
+        '--app-version-ids'
+    ) + @($applications.packageReferenceId)
+
+    if (@($applications | Where-Object { $_.configurationReference }).Count -gt 0) {
+        $args += '--app-config-overrides'
+        foreach ($application in $applications) {
+            if ($application.configurationReference) {
+                $args += $application.configurationReference
+            }
+            else {
+                $args += 'null'
+            }
+        }
+    }
+
+    if (@($applications | Where-Object { $null -ne $_.treatFailureAsDeploymentFailure }).Count -eq $applications.Count) {
+        $args += '--treat-deployment-as-failure'
+        foreach ($application in $applications) {
+            $args += ([string]$application.treatFailureAsDeploymentFailure).ToLowerInvariant()
+        }
+    }
+
+    if (@($applications | Where-Object { $null -ne $_.order }).Count -gt 0) {
+        $args += '--order-applications'
+    }
+
+    $commands += New-AzCommand -Description 'Restore VM Applications.' -Arguments $args
+    return $commands
+}
+
+function Get-DiagnosticSettingRestoreCommands {
+    param($Plan)
+
+    $commands = @()
+    $vm = $Plan.source.vm
+    foreach ($setting in @(Get-PlanSourceCollection -Plan $Plan -Name 'diagnosticSettings')) {
+        if (-not $setting.name) {
+            continue
+        }
+
+        $args = @(
+            'monitor', 'diagnostic-settings', 'create',
+            '--resource', $vm.id,
+            '-n', $setting.name
+        )
+
+        if (@($setting.logs).Count -gt 0) {
+            $args += @('--logs', (ConvertTo-CompactJsonArrayArgument -Value $setting.logs))
+        }
+        if (@($setting.metrics).Count -gt 0) {
+            $args += @('--metrics', (ConvertTo-CompactJsonArrayArgument -Value $setting.metrics))
+        }
+        if ($setting.workspaceId) {
+            $args += @('--workspace', $setting.workspaceId)
+        }
+        if ($setting.storageAccountId) {
+            $args += @('--storage-account', $setting.storageAccountId)
+        }
+        if ($setting.eventHubAuthorizationRuleId) {
+            $args += @('--event-hub-rule', $setting.eventHubAuthorizationRuleId)
+        }
+        if ($setting.eventHubName) {
+            $args += @('--event-hub', $setting.eventHubName)
+        }
+        if ($setting.marketplacePartnerId) {
+            $args += @('--marketplace-partner-id', $setting.marketplacePartnerId)
+        }
+        if ($setting.logAnalyticsDestinationType -eq 'Dedicated') {
+            $args += @('--export-to-resource-specific', 'true')
+        }
+
+        $commands += New-AzCommand -Description "Restore diagnostic setting '$($setting.name)'." -Arguments $args
+    }
+
+    return $commands
+}
+
+function Get-MaintenanceAssignmentRestoreCommands {
+    param($Plan)
+
+    $commands = @()
+    $vm = $Plan.source.vm
+    foreach ($assignment in @(Get-PlanSourceCollection -Plan $Plan -Name 'maintenanceAssignments')) {
+        $configurationId = $assignment.maintenanceConfigurationId
+        if (-not $configurationId -and $assignment.properties -and $assignment.properties.maintenanceConfigurationId) {
+            $configurationId = $assignment.properties.maintenanceConfigurationId
+        }
+
+        if (-not $assignment.name -or -not $configurationId) {
+            continue
+        }
+
+        $args = @(
+            'maintenance', 'assignment', 'create',
+            '--provider-name', 'Microsoft.Compute',
+            '--resource-group', $vm.resourceGroup,
+            '--resource-name', $vm.name,
+            '--resource-type', 'virtualMachines',
+            '--name', $assignment.name,
+            '--maintenance-configuration-id', $configurationId
+        )
+
+        if ($assignment.location) {
+            $args += @('--location', $assignment.location)
+        }
+
+        $commands += New-AzCommand -Description "Restore maintenance assignment '$($assignment.name)'." -Arguments $args
+    }
+
+    return $commands
+}
+
+function Get-ReviewOnlyCommands {
+    param($Plan)
+
+    $commands = @()
+    $vm = $Plan.source.vm
+
+    if (@(Get-PlanSourceCollection -Plan $Plan -Name 'backupProtection').Count -gt 0) {
+        $commands += New-AzCommand -Description 'Review Azure Backup protection after recreation.' -Arguments @(
+            'backup', 'protection', 'check-vm',
+            '--resource-group', $vm.resourceGroup,
+            '--vm', $vm.id,
+            '-o', 'json'
+        )
+    }
+
+    if (@(Get-PlanSourceCollection -Plan $Plan -Name 'policyAssignments').Count -gt 0) {
+        $commands += New-AzCommand -Description 'Review VM-scoped Azure Policy assignments after recreation.' -Arguments @(
+            'policy', 'assignment', 'list',
+            '--scope', $vm.id,
+            '-o', 'table'
+        )
+    }
+
+    if (@(Get-PlanSourceCollection -Plan $Plan -Name 'policyExemptions').Count -gt 0) {
+        $commands += New-AzCommand -Description 'Review VM-scoped Azure Policy exemptions after recreation.' -Arguments @(
+            'policy', 'exemption', 'list',
+            '--scope', $vm.id,
+            '-o', 'table'
+        )
+    }
+
+    return $commands
+}
+
 function Get-PostCreateCommands {
     param($Plan)
 
@@ -3172,6 +3686,7 @@ function Get-SwitchCommands {
     $targetLabel = if ($Plan.decisions.direction -eq 'ToSpot') { 'Spot' } else { 'Regular' }
 
     $commands = @()
+    $commands += Get-DirectLockDeleteCommands -Plan $Plan
     $commands += Get-PrepareCommands -Plan $Plan
     $commands += New-AzCommand -Description 'Deallocate the VM before snapshot/delete/recreate.' -Arguments @(
         'vm', 'deallocate',
@@ -3193,7 +3708,12 @@ function Get-SwitchCommands {
     )
     $commands += New-AzCommand -Description "Recreate the VM as $targetLabel from the preserved OS disk and NICs." -Arguments (Get-CreateVmArgs -Plan $Plan)
     $commands += Get-PostCreateCommands -Plan $Plan
+    $commands += Get-VmApplicationRestoreCommands -Plan $Plan
+    $commands += Get-DiagnosticSettingRestoreCommands -Plan $Plan
+    $commands += Get-MaintenanceAssignmentRestoreCommands -Plan $Plan
     $commands += Get-PowerStateRestoreCommands -Plan $Plan
+    $commands += Get-DirectLockRestoreCommands -Plan $Plan
+    $commands += Get-ReviewOnlyCommands -Plan $Plan
 
     return $commands
 }
@@ -3260,7 +3780,19 @@ function Show-DecisionSummary {
         'DropForSpot' { 'Drop because Spot VMs cannot use availability sets'; break }
         default { 'None' }
     }
+    $reservedPlacementSummary = switch ($Plan.decisions.reservedPlacementAction) {
+        'Preserve' { 'Preserve dedicated host/host group/capacity reservation placement'; break }
+        'DropForSpot' { 'Drop because Spot cannot preserve reserved placement'; break }
+        default { 'None' }
+    }
     Write-Host ("Availability set: {0}" -f $availabilitySetSummary)
+    Write-Host ("Reserved place:   {0}" -f $reservedPlacementSummary)
+    Write-Host ("Locks:            Restore {0} direct VM lock(s)" -f @(Get-PlanSourceCollection -Plan $Plan -Name 'vmLocks').Count)
+    Write-Host ("Diagnostics:      Restore {0} VM diagnostic setting(s)" -f @(Get-PlanSourceCollection -Plan $Plan -Name 'diagnosticSettings').Count)
+    Write-Host ("Maintenance:      Restore {0} maintenance assignment(s)" -f @(Get-PlanSourceCollection -Plan $Plan -Name 'maintenanceAssignments').Count)
+    Write-Host ("VM apps:          Restore {0} VM application(s)" -f @($Plan.source.vm.applicationProfile.galleryApplications).Count)
+    Write-Host ("Backup check:     {0} saved result(s); verify protection after conversion" -f @(Get-PlanSourceCollection -Plan $Plan -Name 'backupProtection').Count)
+    Write-Host ("Policy review:    {0} assignment(s), {1} exemption(s) saved for review" -f @(Get-PlanSourceCollection -Plan $Plan -Name 'policyAssignments').Count, @(Get-PlanSourceCollection -Plan $Plan -Name 'policyExemptions').Count)
     Write-Host ("Pin private IPs:  {0}" -f $Plan.decisions.pinPrivateIps)
     Write-Host ("Snapshots:        {0}" -f $Plan.decisions.createSnapshots)
 }

@@ -96,7 +96,9 @@ Run unattended with explicit parameters:
   -MaxPrice -1 `
   -PinPrivateIps Yes `
   -CreateSnapshots Yes `
-  -ValidateSku No
+  -ValidateSku No `
+  -DropAvailabilitySetForSpot No `
+  -DropReservedPlacementForSpot No
 ```
 
 If `-TargetSku` is omitted, the source VM's exact vCPU/RAM shape is used. Pass
@@ -115,9 +117,13 @@ membership for a Spot conversion. In unattended mode, pass
 
 SpotSwitcher preserves the source VM tags, managed OS disk, managed data disks,
 NICs, primary NIC ordering, optional static private IP pinning, selected VM
-size, zones, Proximity Placement Group, license type, Trusted Launch settings,
-Ultra SSD capability, boot diagnostics, user-assigned identities, and the
-stable source power state where Azure CLI can safely reapply them.
+size, zones, Proximity Placement Group, marketplace plan, compatible dedicated
+host or capacity reservation placement, license type, Trusted Launch settings,
+encryption-at-host, disk controller type, Ultra SSD and hibernation capability,
+boot diagnostics, VM-scoped Azure Monitor diagnostic settings, maintenance
+configuration assignments, VM Applications, direct VM management locks,
+user-assigned identities, and the stable source power state where Azure CLI can
+safely reapply them.
 
 Known Azure recreation gaps to review before execution:
 
@@ -128,14 +134,16 @@ Known Azure recreation gaps to review before execution:
   allow-lists tied to the old principal may need repair.
 - Availability-set membership must be dropped when converting to Spot because
   Azure Spot VMs do not support availability sets.
-- VM-scoped diagnostic settings, backup/protection associations, maintenance
-  configuration assignments, locks, policy exemptions, or other extension
-  resources that are attached to the VM wrapper should be checked after
-  recreation.
-- Dedicated host, capacity reservation, VM applications, secrets/certificates
-  injected through `osProfile`, or other less common VM wrapper settings should
-  be treated as review items until SpotSwitcher explicitly inventories and
-  restores them.
+- Dedicated host, host group, and capacity reservation placement must be
+  intentionally dropped when converting to Spot.
+- Azure Backup protection is detected and saved in the plan, but protection
+  should be verified after recreation.
+- VM-scoped Azure Policy assignments and exemptions are detected and saved in
+  the plan for review, but are not automatically recreated because assignments
+  can carry identity and role-assignment side effects.
+- Secrets/certificates injected through `osProfile`, user data, and other less
+  common VM wrapper settings should be treated as review items until
+  SpotSwitcher explicitly inventories and restores them.
 
 ## Product and Support
 
