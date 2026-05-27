@@ -16,7 +16,9 @@ and the choices needed for the correct direction:
 - Regular or null priority -> convert to Spot
 - Spot or legacy Low priority -> convert to Regular
 
-Default mode is read-only plan generation.
+Default mode is read-only plan generation, followed by a prompt to execute the
+just-previewed plan. Azure resources are not changed unless you choose to
+execute and pass the final exact confirmation prompt.
 After subscription selection, choose whether to browse VMs in the subscription
 or enter the resource group and VM name manually. Manual entry avoids a
 subscription-wide VM list call.
@@ -47,6 +49,17 @@ Execute interactively after reviewing the generated command plan:
 ```powershell
 ./Switch-AzureVmSpotPriority.ps1 -Mode Execute
 ```
+
+If you ran in default Plan mode and stopped after preview, rebuild the plan and
+execute it with:
+
+```powershell
+./Switch-AzureVmSpotPriority.ps1 -Mode Execute
+```
+
+The saved JSON plan is for audit/review. SpotSwitcher executes the live
+in-memory plan immediately after preview rather than replaying an older plan
+file, because VM, NIC, disk, quota, and SKU state can drift.
 
 Run unattended with explicit parameters:
 

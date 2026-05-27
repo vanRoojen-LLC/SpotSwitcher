@@ -19,9 +19,10 @@ the existing managed OS disk, managed data disks, NICs, tags, VM size choice,
 Trusted Launch settings, license type, boot diagnostics, and identities where
 Azure CLI can safely reapply them.
 
-Default mode is Plan, which performs discovery and writes a plan file without
-mutating Azure resources. Execute mode requires an exact confirmation unless
--Force is supplied for unattended automation.
+Default mode is Plan, which performs discovery, writes a plan file, previews the
+commands, and then asks whether to execute that just-built plan. Execute mode
+requires an exact confirmation unless -Force is supplied for unattended
+automation.
 
 .EXAMPLE
 ./Switch-AzureVmSpotPriority.ps1
@@ -126,7 +127,8 @@ Direction is based on the source VM:
   Spot/Low priority    -> ToRegular
 
 Safety defaults:
-  - Plan mode is read-only and writes a plan file.
+  - Plan mode is read-only until you explicitly choose to execute the previewed
+    plan and pass the exact confirmation prompt.
   - Execute mode sets OS disk, data disks, and NIC deleteOption to Detach.
   - Dynamic private IPs can be pinned to static before wrapper deletion.
   - Incremental snapshots can be created after deallocation.
@@ -2741,6 +2743,39 @@ function Show-CommandPreview {
     }
 }
 
+function Resolve-ExecutePreviewedPlan {
+    param(
+        [string]$SavedPlanPath,
+        [string]$RerunCommand
+    )
+
+    Write-Section 'Plan complete'
+    Write-Host 'No Azure resources have been changed yet.'
+    Write-Host "Saved plan: $SavedPlanPath"
+    Write-Host "To rebuild and execute this flow later, run: $RerunCommand"
+
+    if ($NonInteractive) {
+        return $false
+    }
+
+    return Read-MenuChoice `
+        -Title 'Execute previewed plan' `
+        -Default 2 `
+        -Options @(
+            [pscustomobject]@{
+                Label           = 'Execute this plan now'
+                Description     = 'Run the commands shown above after the final exact confirmation prompt.'
+                WaitDescription = 'Next you must type the exact confirmation phrase. Azure resources are still unchanged until that confirmation passes.'
+                Value           = $true
+            },
+            [pscustomobject]@{
+                Label       = 'Stop with saved plan'
+                Description = 'Keep the saved plan and command preview. No Azure resources will be changed.'
+                Value       = $false
+            }
+        )
+}
+
 function Show-DecisionSummary {
     param($Plan)
 
@@ -2792,11 +2827,16 @@ function Invoke-Main {
     $commands = @(Get-SwitchCommands -Plan $plan)
     Show-CommandPreview -Commands $commands
 
+    $shouldExecute = ($selectedMode -eq 'Execute')
     if ($selectedMode -eq 'Plan') {
-        Write-Section 'Plan only'
-        Write-Host 'No changes were made.'
-        Write-Host "Saved plan: $savedPlanPath"
-        return
+        $rerunCommand = './Switch-AzureVmSpotPriority.ps1 -Mode Execute'
+        $shouldExecute = Resolve-ExecutePreviewedPlan -SavedPlanPath $savedPlanPath -RerunCommand $rerunCommand
+        if (-not $shouldExecute) {
+            Write-Section 'Plan only'
+            Write-Host 'No changes were made.'
+            Write-Host "Saved plan: $savedPlanPath"
+            return
+        }
     }
 
     $targetLabel = if ($resolvedDirection -eq 'ToSpot') { 'SPOT' } else { 'REGULAR' }
