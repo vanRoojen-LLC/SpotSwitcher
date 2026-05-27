@@ -98,7 +98,9 @@ Run unattended with explicit parameters:
   -CreateSnapshots Yes `
   -ValidateSku No `
   -DropAvailabilitySetForSpot No `
-  -DropReservedPlacementForSpot No
+  -DropReservedPlacementForSpot No `
+  -AcceptReviewOnlyItems No `
+  -AcceptReservationSavingsImpact No
 ```
 
 If `-TargetSku` is omitted, the source VM's exact vCPU/RAM shape is used. Pass
@@ -144,6 +146,21 @@ Known Azure recreation gaps to review before execution:
 - Secrets/certificates injected through `osProfile`, user data, and other less
   common VM wrapper settings should be treated as review items until
   SpotSwitcher explicitly inventories and restores them.
+
+Reserved VM Instance savings are a billing benefit, not a VM placement setting.
+For Spot conversions, SpotSwitcher checks active VM reservations visible to the
+current identity. If the source VM appears to match a reservation by scope,
+region, and SKU or instance-size-flexibility family, SpotSwitcher warns and
+defaults to stopping so you can decide whether the Reserved Instance benefit
+should be reassigned, exchanged, or otherwise handled before conversion. In
+unattended mode, pass `-AcceptReservationSavingsImpact Yes` to continue after
+saving the matching reservation details in the plan.
+
+Review-only items such as extensions with protected settings, inherited locks,
+Azure Backup protection, VM-scoped Azure Policy artifacts, osProfile
+secrets/certificates, and user data are shown with the current settings
+SpotSwitcher can safely print. In unattended mode, pass
+`-AcceptReviewOnlyItems Yes` to continue after saving those notes in the plan.
 
 ## Product and Support
 

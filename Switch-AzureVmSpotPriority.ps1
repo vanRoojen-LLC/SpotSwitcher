@@ -105,6 +105,12 @@ param(
     [ValidateSet('Auto', 'Yes', 'No')]
     [string]$DropReservedPlacementForSpot = 'Auto',
 
+    [ValidateSet('Auto', 'Yes', 'No')]
+    [string]$AcceptReviewOnlyItems = 'Auto',
+
+    [ValidateSet('Auto', 'Yes', 'No')]
+    [string]$AcceptReservationSavingsImpact = 'Auto',
+
     [string]$PlanPath,
     [switch]$CleanupSnapshots,
 
@@ -139,7 +145,8 @@ Unattended execution:
     -Subscription <sub> -ResourceGroupName <rg> -VmName <vm> `
     -Direction ToSpot -TargetSku <sku> -EvictionPolicy Deallocate -MaxPrice -1 `
     -PinPrivateIps Yes -CreateSnapshots Yes -ValidateSku No `
-    -DropAvailabilitySetForSpot No -DropReservedPlacementForSpot No
+    -DropAvailabilitySetForSpot No -DropReservedPlacementForSpot No `
+    -AcceptReviewOnlyItems No -AcceptReservationSavingsImpact No
 
 Interactive SKU selection:
   - If -TargetSku is omitted, the wizard uses the source VM vCPU/RAM shape by
@@ -175,6 +182,12 @@ Safety defaults:
   - Dedicated host, host group, or capacity reservation placement is preserved
     for regular VM recreation, but must be intentionally dropped for Spot
     conversion because Spot uses spare capacity rather than reserved placement.
+  - Review-only items such as extensions with protected settings, inherited
+    locks, backup state, VM-scoped policy artifacts, osProfile secrets, and user
+    data are listed with current settings before you choose whether to continue.
+  - If an active Reserved VM Instance may be covering the source VM, SpotSwitcher
+    warns and defaults to stopping because converting to Spot can strand or
+    reassign that billing benefit.
   - Execute mode requires exact typed confirmation unless -Force is supplied.
 '@
 }
@@ -935,6 +948,44 @@ function ConvertTo-CompactJsonArrayArgument {
     return '[' + ($jsonItems -join ',') + ']'
 }
 
+function ConvertTo-ReviewText {
+    param(
+        $Value,
+        [int]$MaxLength = 600
+    )
+
+    if ($null -eq $Value) {
+        return '<none>'
+    }
+
+    $text = if ($Value -is [string]) {
+        $Value
+    }
+    else {
+        $Value | ConvertTo-Json -Depth 20 -Compress
+    }
+
+    if ($text.Length -gt $MaxLength) {
+        return ($text.Substring(0, $MaxLength) + '...')
+    }
+
+    return $text
+}
+
+function New-ReviewOnlyItem {
+    param(
+        [string]$Category,
+        [string]$Impact,
+        [string[]]$Details
+    )
+
+    [pscustomobject]@{
+        category = $Category
+        impact   = $Impact
+        details  = @($Details)
+    }
+}
+
 function ConvertTo-NormalizedResourceId {
     param([string]$Id)
 
@@ -978,6 +1029,532 @@ function Get-PlanSourceCollection {
     }
 
     return @()
+}
+
+function Get-ReviewOnlyItems {
+    param($Inventory)
+
+    $items = @()
+    $vm = $Inventory.vm
+
+    $extensions = @($Inventory.extensions)
+    if ($extensions.Count -gt 0) {
+        $details = foreach ($extension in $extensions) {
+            $parts = @(
+                "name=$($extension.name)",
+                "publisher=$($extension.publisher)",
+                "type=$($extension.typePropertiesType)",
+                "version=$($extension.typeHandlerVersion)"
+            )
+            if ($null -ne $extension.autoUpgradeMinorVersion) {
+                $parts += "autoUpgradeMinorVersion=$($extension.autoUpgradeMinorVersion)"
+            }
+            if ($null -ne $extension.enableAutomaticUpgrade) {
+                $parts += "enableAutomaticUpgrade=$($extension.enableAutomaticUpgrade)"
+            }
+            if (@($extension.provisionAfterExtensions).Count -gt 0) {
+                $parts += "provisionAfterExtensions=$(ConvertTo-ReviewText -Value $extension.provisionAfterExtensions -MaxLength 180)"
+            }
+            if ($extension.settings) {
+                $parts += 'publicSettingsPresent=true'
+            }
+
+            $parts -join '; '
+        }
+
+        $items += New-ReviewOnlyItem `
+            -Category 'VM extensions' `
+            -Impact 'Extensions are listed for manual review because protected settings are not recoverable from Azure inventory.' `
+            -Details $details
+    }
+
+    if ($vm.identity -and [string]$vm.identity.type -like '*SystemAssigned*') {
+        $items += New-ReviewOnlyItem `
+            -Category 'System-assigned managed identity' `
+            -Impact 'The identity can be re-enabled, but Azure creates a new principal ID. Re-check RBAC, Key Vault access policies, and app allow-lists after conversion.' `
+            -Details @(
+                "type=$($vm.identity.type)",
+                "principalId=$($vm.identity.principalId)",
+                "tenantId=$($vm.identity.tenantId)"
+            )
+    }
+
+    $inheritedLocks = @($Inventory.inheritedLocks)
+    if ($inheritedLocks.Count -gt 0) {
+        $details = foreach ($lock in $inheritedLocks) {
+            "name=$($lock.name); level=$($lock.level); scope=$($lock.id); notes=$(ConvertTo-ReviewText -Value $lock.notes -MaxLength 180)"
+        }
+
+        $items += New-ReviewOnlyItem `
+            -Category 'Inherited management locks' `
+            -Impact 'Inherited locks are not removed by SpotSwitcher. A parent-scope CanNotDelete or ReadOnly lock may block conversion until removed outside the script.' `
+            -Details $details
+    }
+
+    $backupProtection = @($Inventory.backupProtection)
+    if ($backupProtection.Count -gt 0) {
+        $details = foreach ($backup in $backupProtection) {
+            ConvertTo-ReviewText -Value $backup
+        }
+
+        $items += New-ReviewOnlyItem `
+            -Category 'Azure Backup protection' `
+            -Impact 'Backup protection is detected and saved in the plan, but protection/restore-point association should be verified manually after recreation.' `
+            -Details $details
+    }
+
+    $policyAssignments = @($Inventory.policyAssignments)
+    if ($policyAssignments.Count -gt 0) {
+        $details = foreach ($assignment in $policyAssignments) {
+            $displayName = if ($assignment.displayName) { $assignment.displayName } elseif ($assignment.properties -and $assignment.properties.displayName) { $assignment.properties.displayName } else { '<none>' }
+            $policyDefinitionId = if ($assignment.policyDefinitionId) { $assignment.policyDefinitionId } elseif ($assignment.properties -and $assignment.properties.policyDefinitionId) { $assignment.properties.policyDefinitionId } else { '<none>' }
+            $enforcementMode = if ($assignment.enforcementMode) { $assignment.enforcementMode } elseif ($assignment.properties -and $assignment.properties.enforcementMode) { $assignment.properties.enforcementMode } else { '<none>' }
+            "name=$($assignment.name); displayName=$displayName; enforcementMode=$enforcementMode; policyDefinitionId=$policyDefinitionId; id=$($assignment.id)"
+        }
+
+        $items += New-ReviewOnlyItem `
+            -Category 'VM-scoped Azure Policy assignments' `
+            -Impact 'Policy assignments can include identity and role-assignment side effects. SpotSwitcher saves them for review but does not recreate them automatically.' `
+            -Details $details
+    }
+
+    $policyExemptions = @($Inventory.policyExemptions)
+    if ($policyExemptions.Count -gt 0) {
+        $details = foreach ($exemption in $policyExemptions) {
+            $displayName = if ($exemption.displayName) { $exemption.displayName } elseif ($exemption.properties -and $exemption.properties.displayName) { $exemption.properties.displayName } else { '<none>' }
+            $category = if ($exemption.exemptionCategory) { $exemption.exemptionCategory } elseif ($exemption.properties -and $exemption.properties.exemptionCategory) { $exemption.properties.exemptionCategory } else { '<none>' }
+            $expiresOn = if ($exemption.expiresOn) { $exemption.expiresOn } elseif ($exemption.properties -and $exemption.properties.expiresOn) { $exemption.properties.expiresOn } else { '<none>' }
+            $policyAssignmentId = if ($exemption.policyAssignmentId) { $exemption.policyAssignmentId } elseif ($exemption.properties -and $exemption.properties.policyAssignmentId) { $exemption.properties.policyAssignmentId } else { '<none>' }
+            "name=$($exemption.name); displayName=$displayName; category=$category; expiresOn=$expiresOn; policyAssignmentId=$policyAssignmentId; id=$($exemption.id)"
+        }
+
+        $items += New-ReviewOnlyItem `
+            -Category 'VM-scoped Azure Policy exemptions' `
+            -Impact 'Policy exemptions are saved for review but not automatically recreated because exemption scope and policy assignment references may need manual confirmation.' `
+            -Details $details
+    }
+
+    if ($vm.osProfile -and @($vm.osProfile.secrets).Count -gt 0) {
+        $details = foreach ($secret in @($vm.osProfile.secrets)) {
+            $vaultId = if ($secret.sourceVault -and $secret.sourceVault.id) { $secret.sourceVault.id } else { '<none>' }
+            $certificateDetails = foreach ($certificate in @($secret.vaultCertificates)) {
+                "certificateStore=$($certificate.certificateStore); certificateUrl=$($certificate.certificateUrl)"
+            }
+            "sourceVault=$vaultId; certificates=$(($certificateDetails -join ' | '))"
+        }
+
+        $items += New-ReviewOnlyItem `
+            -Category 'osProfile Key Vault secrets/certificates' `
+            -Impact 'Secret/certificate references are saved in the VM inventory, but SpotSwitcher does not automatically re-inject them on attach-OS-disk recreation.' `
+            -Details $details
+    }
+
+    $userData = $null
+    if ($vm.PSObject.Properties['userData']) {
+        $userData = $vm.userData
+    }
+    elseif ($vm.osProfile -and $vm.osProfile.PSObject.Properties['customData']) {
+        $userData = $vm.osProfile.customData
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$userData)) {
+        $items += New-ReviewOnlyItem `
+            -Category 'VM user data/custom data' `
+            -Impact 'User data or custom data was detected. SpotSwitcher records that it exists but does not print or automatically replay the value because it may contain sensitive bootstrap material.' `
+            -Details @("present=true; length=$(([string]$userData).Length)")
+    }
+
+    return $items
+}
+
+function Get-VmSizeFlexibilityKey {
+    param([string]$Size)
+
+    if ([string]::IsNullOrWhiteSpace($Size)) {
+        return ''
+    }
+
+    $normalized = $Size.Trim()
+    if ($normalized -match '^Standard_([A-Za-z]+)(\d+)([A-Za-z]*)(?:_v(\d+))?$') {
+        $family = $Matches[1]
+        $suffix = $Matches[3]
+        $version = $Matches[4]
+        return (($family + $suffix + $(if ($version) { "v$version" } else { '' })).ToLowerInvariant())
+    }
+
+    return ($normalized.ToLowerInvariant() -replace '\d+', '')
+}
+
+function Get-ReservationProperty {
+    param(
+        $Reservation,
+        [string[]]$Paths
+    )
+
+    return Get-FirstObjectValue -Object $Reservation -Paths $Paths
+}
+
+function Test-ReservationIsActiveVirtualMachine {
+    param($Reservation)
+
+    $resourceType = [string](Get-ReservationProperty -Reservation $Reservation -Paths @('properties.reservedResourceType', 'reservedResourceType'))
+    if ($resourceType -and $resourceType -ne 'VirtualMachines') {
+        return $false
+    }
+
+    $archived = Get-ReservationProperty -Reservation $Reservation -Paths @('properties.archived', 'archived')
+    if ($archived -eq $true -or [string]$archived -eq 'True') {
+        return $false
+    }
+
+    $state = [string](Get-ReservationProperty -Reservation $Reservation -Paths @('properties.provisioningState', 'properties.displayProvisioningState', 'provisioningState', 'displayProvisioningState'))
+    if ($state -and $state -notin @('Succeeded', 'Created', 'Available')) {
+        return $false
+    }
+
+    $expiry = [string](Get-ReservationProperty -Reservation $Reservation -Paths @('properties.expiryDate', 'properties.expiryDateTime', 'expiryDate', 'expiryDateTime'))
+    if (-not [string]::IsNullOrWhiteSpace($expiry)) {
+        try {
+            if ([DateTimeOffset]::Parse($expiry) -lt [DateTimeOffset]::Now) {
+                return $false
+            }
+        }
+        catch {
+        }
+    }
+
+    return $true
+}
+
+function Test-ReservationScopeCouldCoverVm {
+    param(
+        $Reservation,
+        $Vm
+    )
+
+    $scopeType = [string](Get-ReservationProperty -Reservation $Reservation -Paths @('properties.appliedScopeType', 'appliedScopeType'))
+    if ([string]::IsNullOrWhiteSpace($scopeType)) {
+        return $true
+    }
+
+    if ($scopeType -in @('Shared', 'ManagementGroup')) {
+        return $true
+    }
+
+    $vmId = ConvertTo-NormalizedResourceId -Id $Vm.id
+    $subscriptionId = Get-SubscriptionIdFromId -Id $Vm.id
+    $scopeValues = @()
+
+    $appliedScopes = Get-ReservationProperty -Reservation $Reservation -Paths @('properties.appliedScopes', 'appliedScopes')
+    foreach ($scope in @($appliedScopes)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$scope)) {
+            $scopeValues += [string]$scope
+        }
+    }
+
+    $subscriptionScope = Get-ReservationProperty -Reservation $Reservation -Paths @('properties.appliedScopeProperties.subscriptionId', 'appliedScopeProperties.subscriptionId')
+    if ($subscriptionScope) {
+        $scopeValues += "/subscriptions/$subscriptionScope"
+    }
+
+    $resourceGroupScope = Get-ReservationProperty -Reservation $Reservation -Paths @('properties.appliedScopeProperties.resourceGroupId', 'appliedScopeProperties.resourceGroupId')
+    if ($resourceGroupScope) {
+        $scopeValues += [string]$resourceGroupScope
+    }
+
+    if ($scopeValues.Count -eq 0) {
+        return $true
+    }
+
+    foreach ($scope in $scopeValues) {
+        $normalizedScope = ConvertTo-NormalizedResourceId -Id $scope
+        if ([string]::IsNullOrWhiteSpace($normalizedScope)) {
+            continue
+        }
+
+        if ($normalizedScope -eq ("/subscriptions/$subscriptionId").ToLowerInvariant()) {
+            return $true
+        }
+
+        if ($vmId.StartsWith($normalizedScope)) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Test-ReservationLocationCouldCoverVm {
+    param(
+        $Reservation,
+        $Vm
+    )
+
+    $reservationLocation = [string](Get-ReservationProperty -Reservation $Reservation -Paths @('location', 'properties.location', 'properties.appliedScopeProperties.displayName'))
+    if ([string]::IsNullOrWhiteSpace($reservationLocation)) {
+        return $true
+    }
+
+    $left = Get-NormalizedQuotaText -Text $reservationLocation
+    $right = Get-NormalizedQuotaText -Text $Vm.location
+    return ($left -eq $right)
+}
+
+function ConvertTo-ReservationSavingsRecord {
+    param(
+        $Reservation,
+        $Vm
+    )
+
+    if (-not (Test-ReservationIsActiveVirtualMachine -Reservation $Reservation)) {
+        return $null
+    }
+    if (-not (Test-ReservationScopeCouldCoverVm -Reservation $Reservation -Vm $Vm)) {
+        return $null
+    }
+    if (-not (Test-ReservationLocationCouldCoverVm -Reservation $Reservation -Vm $Vm)) {
+        return $null
+    }
+
+    $vmSize = [string]$Vm.hardwareProfile.vmSize
+    $reservationSku = [string](Get-ReservationProperty -Reservation $Reservation -Paths @('sku.name', 'skuName', 'properties.skuName', 'properties.appliedScopeProperties.skuName'))
+    $matchType = 'Potential'
+    if (-not [string]::IsNullOrWhiteSpace($reservationSku)) {
+        if ([string]::Equals($reservationSku, $vmSize, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $matchType = 'ExactSku'
+        }
+        elseif ((Get-VmSizeFlexibilityKey -Size $reservationSku) -eq (Get-VmSizeFlexibilityKey -Size $vmSize)) {
+            $matchType = 'InstanceSizeFlexibilityFamily'
+        }
+        else {
+            return $null
+        }
+    }
+
+    $displayName = [string](Get-ReservationProperty -Reservation $Reservation -Paths @('properties.displayName', 'displayName', 'name'))
+    $scopeType = [string](Get-ReservationProperty -Reservation $Reservation -Paths @('properties.appliedScopeType', 'appliedScopeType'))
+    $quantity = Get-ReservationProperty -Reservation $Reservation -Paths @('properties.quantity', 'quantity')
+    $expiry = [string](Get-ReservationProperty -Reservation $Reservation -Paths @('properties.expiryDate', 'properties.expiryDateTime', 'expiryDate', 'expiryDateTime'))
+    $instanceFlexibility = [string](Get-ReservationProperty -Reservation $Reservation -Paths @('properties.instanceFlexibility', 'instanceFlexibility'))
+    $reservationLocation = [string](Get-ReservationProperty -Reservation $Reservation -Paths @('location', 'properties.location'))
+
+    return [pscustomobject]@{
+        displayName = $displayName
+        reservationId = $Reservation.id
+        sku = $reservationSku
+        sourceVmSize = $vmSize
+        matchType = $matchType
+        location = $reservationLocation
+        sourceVmLocation = $Vm.location
+        appliedScopeType = $scopeType
+        quantity = $quantity
+        expiryDate = $expiry
+        instanceFlexibility = $instanceFlexibility
+    }
+}
+
+function Get-ReservationSavingsImpact {
+    param($Vm)
+
+    try {
+        Write-Info 'Checking for active Reserved VM Instance savings that may apply to the source VM.'
+        Write-WarningLine 'Reserved VM Instance lookup is read-only. The Azure CLI reservation extension may install on first use.'
+        $reservations = @(Invoke-AzJson `
+                -Arguments @('reservations', 'list', '--filter', "properties/reservedResourceType eq 'VirtualMachines'", '-o', 'json') `
+                -AllowEmpty `
+                -TimeoutSeconds 120 `
+                -Description 'Reading Azure reservations visible to the current identity.' `
+                -EnableQuietDynamicExtensionInstall)
+
+        $matches = @()
+        foreach ($reservation in $reservations) {
+            $record = ConvertTo-ReservationSavingsRecord -Reservation $reservation -Vm $Vm
+            if ($record) {
+                $matches += $record
+            }
+        }
+
+        return [pscustomobject]@{
+            status = 'Checked'
+            matches = @($matches)
+            error = $null
+        }
+    }
+    catch {
+        Write-WarningLine "Reserved VM Instance savings lookup could not be completed: $($_.Exception.Message)"
+        return [pscustomobject]@{
+            status = 'LookupFailed'
+            matches = @()
+            error = $_.Exception.Message
+        }
+    }
+}
+
+function Show-ReservationSavingsImpact {
+    param($Impact)
+
+    if ($Impact.status -eq 'LookupFailed') {
+        Write-Section 'Reserved VM Instance check'
+        Write-WarningLine 'SpotSwitcher could not determine whether this VM is covered by Reserved VM Instance savings.'
+        Write-Host ("Reason: {0}" -f $Impact.error) -ForegroundColor Gray
+        return
+    }
+
+    if (@($Impact.matches).Count -eq 0) {
+        return
+    }
+
+    Write-Section 'Reserved VM Instance savings warning'
+    Write-WarningLine 'This source VM appears to match active Reserved VM Instance savings. Converting it to Spot means this VM will no longer consume that regular VM RI benefit; the benefit may move to another matching VM or become unused.'
+    foreach ($match in @($Impact.matches)) {
+        Write-Host ''
+        Write-Host ("  - {0}" -f $(if ($match.displayName) { $match.displayName } else { '<unnamed reservation>' })) -ForegroundColor White
+        Write-Host ("    Match: {0}; reservation SKU: {1}; source VM size: {2}" -f $match.matchType, $match.sku, $match.sourceVmSize) -ForegroundColor Gray
+        Write-Host ("    Scope: {0}; location: {1}; quantity: {2}; expires: {3}" -f $match.appliedScopeType, $match.location, $match.quantity, $match.expiryDate) -ForegroundColor Gray
+        if ($match.reservationId) {
+            Write-Host ("    Reservation: {0}" -f $match.reservationId) -ForegroundColor DarkGray
+        }
+    }
+}
+
+function Resolve-ReservationSavingsImpact {
+    param(
+        $Vm,
+        [string]$ResolvedDirection
+    )
+
+    if ($ResolvedDirection -ne 'ToSpot') {
+        return [pscustomobject]@{
+            status = 'NotApplicable'
+            matches = @()
+            accepted = $true
+            error = $null
+        }
+    }
+
+    $impact = Get-ReservationSavingsImpact -Vm $Vm
+    $matches = @($impact.matches)
+    if ($impact.status -eq 'LookupFailed' -or $matches.Count -eq 0) {
+        Show-ReservationSavingsImpact -Impact $impact
+        return [pscustomobject]@{
+            status = $impact.status
+            matches = $matches
+            accepted = $true
+            error = $impact.error
+        }
+    }
+
+    Show-ReservationSavingsImpact -Impact $impact
+
+    if ($AcceptReservationSavingsImpact -eq 'Yes') {
+        Write-WarningLine 'Reserved VM Instance savings impact accepted by parameter. Notes will be saved in the plan.'
+        return [pscustomobject]@{
+            status = 'Matched'
+            matches = $matches
+            accepted = $true
+            error = $null
+        }
+    }
+
+    if ($AcceptReservationSavingsImpact -eq 'No') {
+        Write-Fail 'Stopped because the source VM appears to match Reserved VM Instance savings and -AcceptReservationSavingsImpact No was supplied.'
+    }
+
+    if ($NonInteractive) {
+        Write-Fail 'Reserved VM Instance savings may apply to this VM. Rerun with -AcceptReservationSavingsImpact Yes to continue unattended.'
+    }
+
+    $continue = Read-MenuChoice `
+        -Title 'Reserved Instance savings impact' `
+        -Default 2 `
+        -Options @(
+            [pscustomobject]@{
+                Label       = 'Continue and save RI warning'
+                Description = 'Proceed with the Spot plan and save the matching reservation details for manual cost follow-up.'
+                Value       = $true
+            },
+            [pscustomobject]@{
+                Label       = 'Stop without building commands'
+                Description = 'Recommended default. Leave Azure unchanged so you can review reservation savings first.'
+                Value       = $false
+            }
+        )
+
+    if ($continue -eq $true) {
+        return [pscustomobject]@{
+            status = 'Matched'
+            matches = $matches
+            accepted = $true
+            error = $null
+        }
+    }
+
+    Write-Fail 'Stopped because Reserved VM Instance savings need review before converting to Spot.'
+}
+
+function Show-ReviewOnlyItems {
+    param([object[]]$Items)
+
+    if (@($Items).Count -eq 0) {
+        return
+    }
+
+    Write-Section 'Manual follow-up warnings'
+    Write-WarningLine 'These source VM settings cannot be safely round-tripped by Azure CLI. SpotSwitcher will save these notes in the plan for post-conversion review.'
+    foreach ($item in @($Items)) {
+        Write-Host ''
+        Write-Host ("  - {0}" -f $item.category) -ForegroundColor White
+        Write-Host ("    Impact: {0}" -f $item.impact) -ForegroundColor Gray
+        foreach ($detail in @($item.details)) {
+            Write-Host ("    Current: {0}" -f $detail) -ForegroundColor DarkGray
+        }
+    }
+}
+
+function Resolve-ReviewOnlyItemsAction {
+    param($Inventory)
+
+    $items = @(Get-ReviewOnlyItems -Inventory $Inventory)
+    if ($items.Count -eq 0) {
+        return $items
+    }
+
+    Show-ReviewOnlyItems -Items $items
+
+    if ($AcceptReviewOnlyItems -eq 'Yes') {
+        Write-WarningLine 'Review-only items accepted by parameter. Notes will be saved in the plan.'
+        return $items
+    }
+
+    if ($AcceptReviewOnlyItems -eq 'No') {
+        Write-Fail 'Stopped because review-only items were detected and -AcceptReviewOnlyItems No was supplied.'
+    }
+
+    if ($NonInteractive) {
+        Write-Fail 'Review-only items were detected. Rerun with -AcceptReviewOnlyItems Yes to continue unattended after saving review notes in the plan.'
+    }
+
+    $continue = Read-MenuChoice `
+        -Title 'Continue with manual follow-up notes' `
+        -Default 1 `
+        -Options @(
+            [pscustomobject]@{
+                Label       = 'Continue and save notes'
+                Description = 'Build the plan and include these current settings as manual post-conversion follow-up notes.'
+                Value       = $true
+            },
+            [pscustomobject]@{
+                Label       = 'Stop without building commands'
+                Description = 'Leave Azure unchanged so you can review these settings first.'
+                Value       = $false
+            }
+        )
+
+    if ($continue -eq $true) {
+        return $items
+    }
+
+    Write-Fail 'Stopped because review-only items need manual review.'
 }
 
 function ConvertTo-IntOrNull {
@@ -2968,6 +3545,8 @@ function Select-Decisions {
     $vm = $Inventory.vm
     $availabilitySetAction = Resolve-AvailabilitySetAction -Vm $vm -ResolvedDirection $ResolvedDirection
     $reservedPlacementAction = Resolve-ReservedPlacementAction -Vm $vm -ResolvedDirection $ResolvedDirection
+    $reservationSavingsImpact = Resolve-ReservationSavingsImpact -Vm $vm -ResolvedDirection $ResolvedDirection
+    $reviewOnlyItems = Resolve-ReviewOnlyItemsAction -Inventory $Inventory
     $targetSkuValue = Select-TargetSku -Vm $vm -Inventory $Inventory -ResolvedDirection $ResolvedDirection
     if (Resolve-SkuValidation) {
         Test-TargetSku -Location $vm.location -Size $targetSkuValue -ResolvedDirection $ResolvedDirection
@@ -3058,6 +3637,8 @@ function Select-Decisions {
         dynamicIpConfigs = $dynamicIpConfigs
         availabilitySetAction = $availabilitySetAction
         reservedPlacementAction = $reservedPlacementAction
+        reservationSavingsImpact = $reservationSavingsImpact
+        reviewOnlyItems = $reviewOnlyItems
     }
 }
 
@@ -3073,7 +3654,7 @@ function New-Plan {
     $sourcePowerStateCode = Get-VmPowerStateCode -InstanceView $Inventory.instanceView
 
     [ordered]@{
-        planVersion = 5
+        planVersion = 6
         generatedAt = (Get-Date).ToString('o')
         planId = "$($vm.name)-$($Decisions.direction)-$stamp"
         subscription = @{
@@ -3093,6 +3674,8 @@ function New-Plan {
             backupProtection = $Inventory.backupProtection
             policyAssignments = $Inventory.policyAssignments
             policyExemptions = $Inventory.policyExemptions
+            reviewOnlyItems = $Decisions.reviewOnlyItems
+            reservationSavingsImpact = $Decisions.reservationSavingsImpact
             nics = $Inventory.nics
             osDisk = $Inventory.osDisk
             dataDisks = $Inventory.dataDisks
@@ -3793,6 +4376,13 @@ function Show-DecisionSummary {
     Write-Host ("VM apps:          Restore {0} VM application(s)" -f @($Plan.source.vm.applicationProfile.galleryApplications).Count)
     Write-Host ("Backup check:     {0} saved result(s); verify protection after conversion" -f @(Get-PlanSourceCollection -Plan $Plan -Name 'backupProtection').Count)
     Write-Host ("Policy review:    {0} assignment(s), {1} exemption(s) saved for review" -f @(Get-PlanSourceCollection -Plan $Plan -Name 'policyAssignments').Count, @(Get-PlanSourceCollection -Plan $Plan -Name 'policyExemptions').Count)
+    if ($Plan.decisions.PSObject.Properties['reservationSavingsImpact']) {
+        $riImpact = $Plan.decisions.reservationSavingsImpact
+        Write-Host ("RI savings:       {0}; {1} possible match(es)" -f $riImpact.status, @($riImpact.matches).Count)
+    }
+    if ($Plan.decisions.PSObject.Properties['reviewOnlyItems']) {
+        Write-Host ("Manual notes:     {0} review-only item(s)" -f @($Plan.decisions.reviewOnlyItems).Count)
+    }
     Write-Host ("Pin private IPs:  {0}" -f $Plan.decisions.pinPrivateIps)
     Write-Host ("Snapshots:        {0}" -f $Plan.decisions.createSnapshots)
 }
