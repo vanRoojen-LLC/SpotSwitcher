@@ -362,6 +362,42 @@ function New-AzCommand {
     }
 }
 
+function New-AzureResourceName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Parts,
+        [int]$MaxLength = 80
+    )
+
+    $raw = ($Parts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join '-'
+    $safe = ($raw -replace '[^A-Za-z0-9_.-]', '-').Trim('-_.')
+    if ([string]::IsNullOrWhiteSpace($safe)) {
+        $safe = 'spotswitcher-resource'
+    }
+
+    if ($safe.Length -le $MaxLength) {
+        return $safe
+    }
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hashBytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($safe))
+    }
+    finally {
+        $sha.Dispose()
+    }
+
+    $hash = -join ($hashBytes[0..3] | ForEach-Object { $_.ToString('x2') })
+    $suffix = "-$hash"
+    $prefixLength = [math]::Max(1, $MaxLength - $suffix.Length)
+    $prefix = $safe.Substring(0, $prefixLength).Trim('-_.')
+    if ([string]::IsNullOrWhiteSpace($prefix)) {
+        $prefix = 'spotswitcher'
+    }
+
+    return ($prefix + $suffix)
+}
+
 function Invoke-CommandList {
     param(
         [object[]]$Commands,
@@ -2574,10 +2610,11 @@ function Get-SnapshotCommands {
 
     $osDisk = $Plan.source.osDisk
     $osDiskRg = if ($osDisk.resourceGroup) { $osDisk.resourceGroup } else { Get-ResourceGroupFromId -Id $osDisk.id }
+    $osSnapshotName = New-AzureResourceName -Parts @($Plan.planId, 'os') -MaxLength 80
     $commands += New-AzCommand -Description 'Create incremental snapshot of the OS disk.' -Arguments (@(
             'snapshot', 'create',
             '-g', $osDiskRg,
-            '-n', "$($vm.name)-os-pre-switch-$($Plan.planId)",
+            '-n', $osSnapshotName,
             '--source', $osDisk.id,
             '--incremental', 'true',
             '--tags'
@@ -2585,10 +2622,11 @@ function Get-SnapshotCommands {
 
     foreach ($disk in @($Plan.source.dataDisks)) {
         $diskRg = if ($disk.resourceGroup) { $disk.resourceGroup } else { Get-ResourceGroupFromId -Id $disk.id }
+        $dataSnapshotName = New-AzureResourceName -Parts @($Plan.planId, 'data', "lun$($disk.lun)", $disk.name) -MaxLength 80
         $commands += New-AzCommand -Description "Create incremental snapshot of data disk $($disk.name)." -Arguments (@(
                 'snapshot', 'create',
                 '-g', $diskRg,
-                '-n', "$($vm.name)-data-$($disk.name)-pre-switch-$($Plan.planId)",
+                '-n', $dataSnapshotName,
                 '--source', $disk.id,
                 '--incremental', 'true',
                 '--tags'
