@@ -2491,7 +2491,6 @@ function Get-CreateVmArgs {
         '--size', $decisions.targetSku,
         '--attach-os-disk', $vm.storageProfile.osDisk.managedDisk.id,
         '--os-type', $osType,
-        '--os-disk-caching', $vm.storageProfile.osDisk.caching,
         '--os-disk-delete-option', 'Detach',
         '--nics'
     )
