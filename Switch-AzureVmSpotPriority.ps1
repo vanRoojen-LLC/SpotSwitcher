@@ -100,6 +100,13 @@ param(
 
     [string]$PlanPath,
     [switch]$CleanupSnapshots,
+
+    [ValidateRange(1, 1440)]
+    [int]$PowerStateWaitTimeoutMinutes = 30,
+
+    [ValidateRange(5, 300)]
+    [int]$PowerStatePollSeconds = 15,
+
     [switch]$NonInteractive,
     [switch]$Force,
     [switch]$Help
@@ -151,6 +158,8 @@ Safety defaults:
   - Incremental snapshots can be created after deallocation.
   - Stable source power states are restored after recreation: running remains
     running, stopped is stopped, and deallocated is deallocated.
+  - Transitional source power states are waited on until the VM reaches a stable
+    state. Tune with -PowerStateWaitTimeoutMinutes and -PowerStatePollSeconds.
   - Availability-set membership is preserved for regular VMs, but must be
     intentionally dropped when converting to Spot because Azure does not support
     Spot VMs in availability sets.
@@ -877,13 +886,41 @@ function Test-StableVmPowerState {
     return @('PowerState/running', 'PowerState/stopped', 'PowerState/deallocated') -contains $PowerStateCode
 }
 
-function Assert-StableSourcePowerState {
+function Wait-ForStableSourcePowerState {
     param($Inventory)
 
     $powerStateCode = Get-VmPowerStateCode -InstanceView $Inventory.instanceView
-    if (-not (Test-StableVmPowerState -PowerStateCode $powerStateCode)) {
-        Write-Fail "Source VM power state is '$powerStateCode'. Wait until the VM is running, stopped, or deallocated so SpotSwitcher can restore the original power state after conversion."
+    if (Test-StableVmPowerState -PowerStateCode $powerStateCode) {
+        return $Inventory
     }
+
+    $vm = $Inventory.vm
+    $deadline = [DateTimeOffset]::Now.AddMinutes($PowerStateWaitTimeoutMinutes)
+
+    Write-Section 'Power state wait'
+    Write-WarningLine "Source VM power state is '$powerStateCode'. SpotSwitcher will wait for running, stopped, or deallocated before planning conversion."
+    Write-Info "Timeout: $PowerStateWaitTimeoutMinutes minute(s). Poll interval: $PowerStatePollSeconds second(s)."
+
+    while ([DateTimeOffset]::Now -lt $deadline) {
+        $display = Get-VmPowerStateDisplay -InstanceView $Inventory.instanceView
+        $code = Get-VmPowerStateCode -InstanceView $Inventory.instanceView
+        Write-Info "Current power state: $display ($code). Checking again in $PowerStatePollSeconds seconds."
+        Start-Sleep -Seconds $PowerStatePollSeconds
+
+        $Inventory.instanceView = Invoke-AzJson `
+            -Arguments @('vm', 'get-instance-view', '-g', $vm.resourceGroup, '-n', $vm.name, '-o', 'json') `
+            -Description 'Checking current VM power state.'
+
+        $powerStateCode = Get-VmPowerStateCode -InstanceView $Inventory.instanceView
+        if (Test-StableVmPowerState -PowerStateCode $powerStateCode) {
+            $display = Get-VmPowerStateDisplay -InstanceView $Inventory.instanceView
+            Write-Info "Source VM reached stable power state: $display ($powerStateCode)."
+            return $Inventory
+        }
+    }
+
+    $finalCode = Get-VmPowerStateCode -InstanceView $Inventory.instanceView
+    Write-Fail "Timed out after $PowerStateWaitTimeoutMinutes minute(s) waiting for source VM to reach running, stopped, or deallocated. Last power state: '$finalCode'."
 }
 
 function Get-PowerStateRestoreSummary {
@@ -3195,8 +3232,8 @@ function Invoke-Main {
     $account = Select-Subscription
     $target = Select-TargetVm
     $inventory = Get-VmInventory -ResourceGroup $target.resourceGroup -Name $target.name
+    $inventory = Wait-ForStableSourcePowerState -Inventory $inventory
     Show-InventorySummary -Inventory $inventory
-    Assert-StableSourcePowerState -Inventory $inventory
 
     $resolvedDirection = Select-Direction -Inventory $inventory
     if ($resolvedDirection -eq 'Cancel') {

@@ -45,6 +45,8 @@ subscription data, tenant data, plan files, secrets, or telemetry to vanRoojen
 LLC.
 For stable source states, conversion returns the VM to the original power state:
 running, stopped, or deallocated.
+For transitional source states, conversion warns and waits until the VM reaches
+running, stopped, or deallocated before building the conversion plan.
 Snapshot cleanup lists tagged SpotSwitcher snapshots before asking for exact
 confirmation to delete them.
 

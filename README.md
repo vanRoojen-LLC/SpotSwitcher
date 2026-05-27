@@ -26,6 +26,9 @@ execute and pass the final exact confirmation prompt.
 During conversion, SpotSwitcher records the source VM power state and restores
 stable states after recreation: running VMs remain running, stopped VMs are
 stopped again, and deallocated VMs are deallocated again.
+If Azure reports a transitional source state such as starting or deallocating,
+SpotSwitcher warns and waits until the VM reaches a stable state before planning
+the conversion.
 After subscription selection, choose whether to browse VMs in the subscription
 or enter the resource group and VM name manually. Manual entry avoids a
 subscription-wide VM list call.
