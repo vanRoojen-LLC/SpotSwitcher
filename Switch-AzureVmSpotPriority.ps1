@@ -159,9 +159,12 @@ Interactive SKU selection:
     data disks, NIC count, accelerated networking, Premium/Ultra storage,
     encryption at host, OS disk size, Hyper-V generation, and source zone.
   - For Spot conversions, candidate SKUs must meet or exceed the source VM
-    vCPU/RAM shape, then browse results are sorted by lowest estimated whole
-    USD/month retail cost when the public Azure Retail Prices API returns a
-    match.
+    vCPU/RAM shape. If the current SKU is valid for the switch, it is listed
+    first as "Current SKU"; alternatives favor the same broad family/core token
+    such as D2 or E4 before falling back to lowest estimated whole USD/month
+    retail cost.
+  - The picker shows five SKU choices at a time. Use Custom filter to search
+    all eligible SKUs by another token such as E2, D4s, or Standard_D4ads_v6.
   - For Regular conversions, candidate SKUs use the exact source VM vCPU/RAM
     shape unless -TargetCores or -TargetMemoryGB override it.
 
@@ -2573,6 +2576,66 @@ function Add-SkuPricing {
         })
 }
 
+function Get-SkuBroadFamilyCoreToken {
+    param([string]$SkuName)
+
+    if ([string]::IsNullOrWhiteSpace($SkuName)) {
+        return $null
+    }
+
+    $shortName = $SkuName -replace '^Standard_', ''
+    if ($shortName -match '^([A-Za-z]+)([0-9]+)') {
+        return ($matches[1] + $matches[2])
+    }
+
+    return $null
+}
+
+function Test-SkuBroadFamilyCoreMatch {
+    param(
+        [string]$SkuName,
+        [string]$Token
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Token)) {
+        return $false
+    }
+
+    return ((Get-SkuBroadFamilyCoreToken -SkuName $SkuName) -eq $Token)
+}
+
+function Copy-SkuChoice {
+    param(
+        $Candidate,
+        [string]$DisplayName,
+        [string]$DescriptionPrefix
+    )
+
+    $description = if ($Candidate.PSObject.Properties['description'] -and -not [string]::IsNullOrWhiteSpace([string]$Candidate.description)) {
+        [string]$Candidate.description
+    }
+    else {
+        [string]$Candidate.quotaDescription
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($DescriptionPrefix)) {
+        $description = "$DescriptionPrefix$description"
+    }
+
+    [pscustomobject]@{
+        name             = $Candidate.name
+        displayName      = if ($DisplayName) { $DisplayName } else { $Candidate.name }
+        sku              = $Candidate.sku
+        quotaDescription = $Candidate.quotaDescription
+        quotaConfidence  = $Candidate.quotaConfidence
+        score            = $Candidate.score
+        priceInfo        = $Candidate.priceInfo
+        priceSort        = $Candidate.priceSort
+        priceDescription = $Candidate.priceDescription
+        description      = $description
+    }
+}
+
 function Convert-MemoryMBToGB {
     param($MemoryMB)
 
@@ -2954,50 +3017,81 @@ function Get-QuotaEligibleSkus {
 function Select-PagedSku {
     param(
         [string]$Title,
-        [object[]]$Candidates
+        [object[]]$Candidates,
+        [object[]]$FilterCandidates
     )
 
-    $pageSize = 10
+    if (-not $FilterCandidates -or $FilterCandidates.Count -eq 0) {
+        $FilterCandidates = $Candidates
+    }
+
+    $pageSize = 5
     $offset = 0
+    $activeCandidates = @($Candidates)
+    $activeFilter = $null
 
     while ($true) {
-        $page = @($Candidates | Select-Object -Skip $offset -First $pageSize)
-        $options = foreach ($candidate in $page) {
+        $page = @($activeCandidates | Select-Object -Skip $offset -First $pageSize)
+        $options = @(foreach ($candidate in $page) {
             $description = if ($candidate.PSObject.Properties['description'] -and -not [string]::IsNullOrWhiteSpace([string]$candidate.description)) {
                 [string]$candidate.description
             }
             else {
                 [string]$candidate.quotaDescription
             }
+            $label = if ($candidate.PSObject.Properties['displayName'] -and -not [string]::IsNullOrWhiteSpace([string]$candidate.displayName)) {
+                [string]$candidate.displayName
+            }
+            else {
+                [string]$candidate.name
+            }
             [pscustomobject]@{
-                Label       = $candidate.name
+                Label       = $label
                 Description = $description
                 Value       = $candidate.name
             }
-        }
+        })
 
-        if (($offset + $pageSize) -lt $Candidates.Count) {
+        if (($offset + $pageSize) -lt $activeCandidates.Count) {
             $options += [pscustomobject]@{
-                Label       = 'Show 10 more'
-                Description = "Showing $($offset + 1)-$($offset + $page.Count) of $($Candidates.Count)."
+                Label       = 'Show 5 more'
+                Description = "Showing $($offset + 1)-$($offset + $page.Count) of $($activeCandidates.Count)."
                 Value       = '__more__'
             }
         }
 
         $options += [pscustomobject]@{
-            Label       = 'Enter a SKU manually'
-            Description = 'Use this if the SKU you want is not listed or quota matching was inconclusive.'
-            Value       = '__manual__'
+            Label       = 'Custom filter'
+            Description = 'Search eligible SKUs by name, for example E2, D4s, or Standard_D4ads_v6.'
+            Value       = '__filter__'
         }
 
-        $selected = Read-MenuChoice -Title $Title -Options $options -Default 1
+        $menuTitle = if ($activeFilter) { "$Title - filter '$activeFilter'" } else { $Title }
+        $selected = Read-MenuChoice -Title $menuTitle -Options $options -Default 1
         if ($selected -eq '__more__') {
             $offset += $pageSize
             continue
         }
 
-        if ($selected -eq '__manual__') {
-            return (Read-RequiredText -Prompt 'Target VM size' -ExistingValue $null)
+        if ($selected -eq '__filter__') {
+            $filter = Read-Host 'Filter eligible SKU names, or press Enter to reset'
+            if ([string]::IsNullOrWhiteSpace($filter)) {
+                $activeCandidates = @($Candidates)
+                $activeFilter = $null
+                $offset = 0
+                continue
+            }
+
+            $filtered = @($FilterCandidates | Where-Object { $_.name -like "*$filter*" })
+            if ($filtered.Count -eq 0) {
+                Write-WarningLine "No eligible SKU names matched '$filter'. Try another family or size token, for example E2 or D4s."
+                continue
+            }
+
+            $activeCandidates = $filtered
+            $activeFilter = $filter
+            $offset = 0
+            continue
         }
 
         return $selected
@@ -3013,7 +3107,7 @@ function Select-PagedVm {
 
     while ($true) {
         $page = @($sortedVms | Select-Object -Skip $offset -First $pageSize)
-        $options = foreach ($vm in $page) {
+        $options = @(foreach ($vm in $page) {
             $priority = if ($vm.priority) { $vm.priority } else { 'Regular' }
             $next = if ($priority -in @('Spot', 'Low')) { 'ToRegular' } else { 'ToSpot' }
             [pscustomobject]@{
@@ -3022,7 +3116,7 @@ function Select-PagedVm {
                 WaitDescription = 'Next the script reads detailed VM inventory: instance view, NICs, disks, and extensions. That can take 30-90 seconds.'
                 Value           = $vm
             }
-        }
+        })
 
         if (($offset + $pageSize) -lt $sortedVms.Count) {
             $options += [pscustomobject]@{
@@ -3435,12 +3529,6 @@ function Select-TargetSku {
 
     $currentSize = $Vm.hardwareProfile.vmSize
     $title = if ($ResolvedDirection -eq 'ToSpot') { 'Target Spot SKU' } else { 'Target Regular SKU' }
-    $browseDescription = if ($ResolvedDirection -eq 'ToSpot') {
-        'Browse unrestricted, quota-eligible Spot-capable SKUs in this region. Sorted by lowest estimated monthly retail cost first.'
-    }
-    else {
-        'Browse unrestricted, quota-eligible VM SKUs in this region.'
-    }
 
     $regionalSizes = @(Get-RegionalVmSizes -Location $Vm.location)
     $sourceSize = @($regionalSizes | Where-Object { $_.name -eq $currentSize } | Select-Object -First 1)
@@ -3466,8 +3554,7 @@ function Select-TargetSku {
     $candidateSizeNames = @(Get-CandidateVmSizeNames -Sizes $regionalSizes -Cores $targetShape.Cores -MemoryMB $targetShape.MemoryMB -Minimum:$useMinimumShape)
     if ($candidateSizeNames.Count -eq 0) {
         $matchText = if ($useMinimumShape) { 'met or exceeded' } else { 'exactly matched' }
-        Write-WarningLine "No VM sizes in $($Vm.location) $matchText $($targetShape.Cores) vCPU / $(Format-MemoryGB -MemoryGB $targetShape.MemoryGB) GiB RAM. Falling back to manual entry."
-        return (Read-RequiredText -Prompt 'Target VM size' -ExistingValue $null)
+        Write-Fail "No VM sizes in $($Vm.location) $matchText $($targetShape.Cores) vCPU / $(Format-MemoryGB -MemoryGB $targetShape.MemoryGB) GiB RAM. Pass -TargetSku to use a specific SKU explicitly."
     }
 
     if ($useMinimumShape) {
@@ -3515,92 +3602,53 @@ function Select-TargetSku {
     $targetSkus = @(Get-SourceCompatibleSkus -Skus $targetSkus -Requirements $sourceRequirements)
     $eligibleSkus = @(Get-QuotaEligibleSkus -Skus $targetSkus -Usages $quotaUsages -ResolvedDirection $ResolvedDirection -SourceSku $sourceSku -SourceVm $Vm)
     if ($eligibleSkus.Count -eq 0) {
-        Write-WarningLine 'No unrestricted quota-eligible SKUs were found. Falling back to manual entry.'
-        return (Read-RequiredText -Prompt 'Target VM size' -ExistingValue $null)
+        Write-Fail 'No unrestricted quota-eligible SKUs were found. Pass -TargetSku to use a specific SKU explicitly.'
     }
     $eligibleSkus = @(Add-SkuPricing -Candidates $eligibleSkus -Location $Vm.location -ResolvedDirection $ResolvedDirection -SourceVm $Vm)
     $currentEligible = @($eligibleSkus | Where-Object { $_.name -eq $currentSize } | Select-Object -First 1)
-    $browseSkus = if ($ResolvedDirection -eq 'ToSpot') {
+    $costSortedSkus = if ($ResolvedDirection -eq 'ToSpot') {
         @($eligibleSkus | Sort-Object quotaConfidence, priceSort, score, name)
     }
     else {
         @($eligibleSkus | Sort-Object quotaConfidence, score, priceSort, name)
     }
-    $recommendedSku = @($browseSkus | Select-Object -First 1)
 
-    $primarySkuOption = if ($ResolvedDirection -eq 'ToSpot' -and $recommendedSku.Count -gt 0) {
-        [pscustomobject]@{
-            Label       = "Use lowest-cost sufficient Spot size: $($recommendedSku[0].name)"
-            Description = "Meets or exceeds $($targetShape.Cores) vCPU / $(Format-MemoryGB -MemoryGB $targetShape.MemoryGB) GiB RAM. $($recommendedSku[0].description)"
-            Value       = $recommendedSku[0].name
+    $displaySkus = @()
+    $filterSkus = @($costSortedSkus)
+    if ($currentEligible.Count -gt 0) {
+        $currentChoice = Copy-SkuChoice `
+            -Candidate $currentEligible[0] `
+            -DisplayName "Current SKU: $currentSize" `
+            -DescriptionPrefix 'Keep the current VM size. '
+        $alternatives = @($costSortedSkus | Where-Object { $_.name -ne $currentSize })
+        $filterSkus = @(@($currentChoice) + @($alternatives))
+
+        $autoFilterToken = Get-SkuBroadFamilyCoreToken -SkuName $currentSize
+        if ($autoFilterToken) {
+            $similarAlternatives = @($alternatives | Where-Object { Test-SkuBroadFamilyCoreMatch -SkuName $_.name -Token $autoFilterToken })
+            $otherAlternatives = @($alternatives | Where-Object { -not (Test-SkuBroadFamilyCoreMatch -SkuName $_.name -Token $autoFilterToken) })
+            $alternatives = @($similarAlternatives + $otherAlternatives)
+            if ($similarAlternatives.Count -gt 0) {
+                Write-Info "Current SKU is valid for the target. Showing it first, then $autoFilterToken alternatives sorted by estimated monthly cost."
+            }
+            else {
+                Write-Info 'Current SKU is valid for the target. Showing it first, then alternatives sorted by estimated monthly cost.'
+            }
         }
-    }
-    elseif ($currentEligible.Count -gt 0) {
-        [pscustomobject]@{
-            Label       = "Keep current size: $currentSize"
-            Description = "Available for the target priority. $($currentEligible[0].description)"
-            Value       = $currentSize
+        else {
+            Write-Info 'Current SKU is valid for the target. Showing it first, then alternatives sorted by estimated monthly cost.'
         }
-    }
-    elseif ($recommendedSku.Count -gt 0) {
-        [pscustomobject]@{
-            Label       = "Use closest available size: $($recommendedSku[0].name)"
-            Description = "Current size '$currentSize' was not available for target priority/quota. $($recommendedSku[0].description)"
-            Value       = $recommendedSku[0].name
-        }
+
+        Write-Info 'Use Custom filter to search all eligible SKUs by another token such as E2 or D4s.'
+        $displaySkus = @(@($currentChoice) + @($alternatives))
     }
     else {
-        $null
+        Write-Info "Current SKU '$currentSize' is not eligible for the target priority/quota, so it is not listed."
+        Write-Info 'Showing the lowest-cost eligible alternatives. Use Custom filter to search all eligible SKUs by another token such as E2 or D4s.'
+        $displaySkus = $costSortedSkus
     }
 
-    $menuOptions = @()
-    if ($primarySkuOption) {
-        $menuOptions += $primarySkuOption
-    }
-
-    $menuOptions += @(
-        [pscustomobject]@{
-            Label           = 'Browse eligible SKUs'
-            Description     = $browseDescription
-            WaitDescription = 'The SKU list shows 10 options at a time so Cloud Shell stays readable.'
-            Value           = 'browse'
-        },
-        [pscustomobject]@{
-            Label       = 'Enter a different SKU manually'
-            Description = 'Example: Standard_D4s_v5 or Standard_D4ads_v6.'
-            Value       = 'manual'
-        }
-    )
-
-    $choice = Read-MenuChoice `
-        -Title $title `
-        -Default 1 `
-        -Options $menuOptions
-
-    if ($choice -ne 'browse' -and $choice -ne 'manual') {
-        return $choice
-    }
-
-    if ($choice -eq 'manual') {
-        return (Read-RequiredText -Prompt 'Target VM size' -ExistingValue $null)
-    }
-
-    $filter = ''
-    if (-not $NonInteractive) {
-        $filter = Read-Host 'Filter SKU names, or press Enter for the 10 lowest-cost matches'
-    }
-
-    $skus = $browseSkus
-    if (-not [string]::IsNullOrWhiteSpace($filter)) {
-        $skus = @($skus | Where-Object { $_.name -like "*$filter*" })
-    }
-
-    if ($skus.Count -eq 0) {
-        Write-WarningLine 'No matching quota-eligible SKUs were returned. Falling back to manual entry.'
-        return (Read-RequiredText -Prompt 'Target VM size' -ExistingValue $null)
-    }
-
-    return (Select-PagedSku -Title $title -Candidates $skus)
+    return (Select-PagedSku -Title $title -Candidates $displaySkus -FilterCandidates $filterSkus)
 }
 
 function Test-TargetSku {

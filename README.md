@@ -37,20 +37,23 @@ or enter the resource group and VM name manually. Manual entry avoids a
 subscription-wide VM list call.
 When choosing a target size, Spot conversions treat the source VM's vCPU/RAM
 shape as the minimum required capacity unless `-TargetCores` or
-`-TargetMemoryGB` override it, then recommend the lowest-cost viable Spot SKU.
-Regular conversions use the exact source vCPU/RAM shape by default. The picker
-also filters for source compatibility where Azure reports the data: CPU
+`-TargetMemoryGB` override it. Regular conversions use the exact source vCPU/RAM
+shape by default. The picker also filters for source compatibility where Azure
+reports the data: CPU
 architecture, attached data disk count, NIC count, accelerated networking,
 Premium/Ultra disk support, encryption at host, OS disk size, Hyper-V
 generation, and source zone availability. For Spot conversions, the default
-recommendation prioritizes the lowest-cost unrestricted, quota-eligible Spot
-size that satisfies the source capacity needs instead of preferring the current
-or closest size.
-Browse results are shown 10 at a time and sorted by lowest estimated USD/month
-retail cost when the public Azure Retail Prices API returns a match. The
-estimate is rounded to the nearest whole dollar, uses 730 hours/month, and
-does not include private discounts, reservations, savings plans, Azure Hybrid
-Benefit, taxes, or future Spot price changes.
+list shows the current SKU first when it is valid for the switch, labeled as
+`Current SKU`, then shows same broad family/core alternatives such as `D2` or
+`E4` before falling back to cost-sorted options. If the current SKU is not valid
+for the target priority/quota, it is not shown and the list starts with the
+lowest-cost eligible alternatives.
+SKU results are shown five at a time. Use `Custom filter` to search all eligible
+SKU names by another token, for example `E2`, `D4s`, or `Standard_D4ads_v6`.
+Prices are estimated USD/month retail cost when the public Azure Retail Prices
+API returns a match. The estimate is rounded to the nearest whole dollar, uses
+730 hours/month, and does not include private discounts, reservations, savings
+plans, Azure Hybrid Benefit, taxes, or future Spot price changes.
 Quota filtering uses the Azure CLI `quota` extension when available, then falls
 back to legacy compute usage, which may not expose Spot quota.
 
