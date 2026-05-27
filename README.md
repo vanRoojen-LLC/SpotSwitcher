@@ -20,9 +20,9 @@ The opening menu also includes a snapshot cleanup task. Cleanup lists snapshots
 created by SpotSwitcher, identified by the script's snapshot tags, before asking
 for exact confirmation to delete them.
 
-Default mode is read-only plan generation, followed by a prompt to execute the
-just-previewed plan. Azure resources are not changed unless you choose to
-execute and pass the final exact confirmation prompt.
+The default wizard is read-only through discovery, plan generation, and command
+preview. Azure resources are not changed unless you choose to run the
+just-previewed conversion and pass the final exact confirmation prompt.
 During conversion, SpotSwitcher records the source VM power state and restores
 stable states after recreation: running VMs remain running, stopped VMs are
 stopped again, and deallocated VMs are deallocated again.
@@ -35,15 +35,22 @@ the conversion.
 After subscription selection, choose whether to browse VMs in the subscription
 or enter the resource group and VM name manually. Manual entry avoids a
 subscription-wide VM list call.
-When choosing a target size, the SKU picker starts from the source VM's exact
-vCPU/RAM shape unless `-TargetCores` or `-TargetMemoryGB` override it. It also
-filters for source compatibility where Azure reports the data: CPU architecture,
-attached data disk count, NIC count, accelerated networking, Premium/Ultra disk
-support, encryption at host, OS disk size, Hyper-V generation, and source zone
-availability. For Spot conversions, it only offers the current VM size if it is
-Spot-capable and appears to fit available quota. Otherwise it recommends the
-closest unrestricted, quota-eligible Spot size. Browse results are shown five at
-a time.
+When choosing a target size, Spot conversions treat the source VM's vCPU/RAM
+shape as the minimum required capacity unless `-TargetCores` or
+`-TargetMemoryGB` override it, then recommend the lowest-cost viable Spot SKU.
+Regular conversions use the exact source vCPU/RAM shape by default. The picker
+also filters for source compatibility where Azure reports the data: CPU
+architecture, attached data disk count, NIC count, accelerated networking,
+Premium/Ultra disk support, encryption at host, OS disk size, Hyper-V
+generation, and source zone availability. For Spot conversions, the default
+recommendation prioritizes the lowest-cost unrestricted, quota-eligible Spot
+size that satisfies the source capacity needs instead of preferring the current
+or closest size.
+Browse results are shown 10 at a time and sorted by lowest estimated USD/month
+retail cost when the public Azure Retail Prices API returns a match. The
+estimate is rounded to the nearest whole dollar, uses 730 hours/month, and
+does not include private discounts, reservations, savings plans, Azure Hybrid
+Benefit, taxes, or future Spot price changes.
 Quota filtering uses the Azure CLI `quota` extension when available, then falls
 back to legacy compute usage, which may not expose Spot quota.
 
@@ -63,20 +70,20 @@ Clean up snapshots created by SpotSwitcher:
 ./Switch-AzureVmSpotPriority.ps1 -CleanupSnapshots
 ```
 
-Execute interactively after reviewing the generated command plan:
+Skip the post-preview run prompt and go straight to final confirmation:
 
 ```powershell
 ./Switch-AzureVmSpotPriority.ps1 -Mode Execute
 ```
 
-If you ran in default Plan mode and stopped after preview, rebuild the plan and
-execute it with:
+If you stopped after preview, rebuild the plan and go straight to final
+confirmation with:
 
 ```powershell
 ./Switch-AzureVmSpotPriority.ps1 -Mode Execute
 ```
 
-The saved JSON plan is for audit/review. SpotSwitcher executes the live
+The saved JSON plan is for audit/review. SpotSwitcher runs the live
 in-memory plan immediately after preview rather than replaying an older plan
 file, because VM, NIC, disk, quota, and SKU state can drift.
 
@@ -103,12 +110,17 @@ Run unattended with explicit parameters:
   -AcceptReservationSavingsImpact No
 ```
 
-If `-TargetSku` is omitted, the source VM's exact vCPU/RAM shape is used. Pass
-`-TargetCores` and `-TargetMemoryGB` to override that shape before browsing
-candidate SKUs.
+If `-TargetSku` is omitted, Spot conversions use the source VM's vCPU/RAM as a
+minimum capacity target, while Regular conversions use the exact source shape.
+Pass `-TargetCores` and `-TargetMemoryGB` to override that shape before
+browsing candidate SKUs.
 
 The script writes plan files to `~/clouddrive/SpotSwitcherPlans` in Cloud Shell
 when Cloud Drive is mounted, otherwise to `./SpotSwitcherPlans`.
+Plan files can contain Azure resource IDs, VM configuration metadata, and
+operator choices. SpotSwitcher redacts VM `userData`, `osProfile.customData`,
+and extension settings before saving the plan, but plan files should still be
+handled as operational change records.
 
 Azure Spot VMs cannot be created in availability sets. If a source VM is in an
 availability set, SpotSwitcher prompts before intentionally dropping that
@@ -161,6 +173,8 @@ Azure Backup protection, VM-scoped Azure Policy artifacts, osProfile
 secrets/certificates, and user data are shown with the current settings
 SpotSwitcher can safely print. In unattended mode, pass
 `-AcceptReviewOnlyItems Yes` to continue after saving those notes in the plan.
+The saved plan includes a `source.sensitiveRedactions` list when sensitive
+bootstrap fields were present and intentionally omitted.
 
 ## Product and Support
 

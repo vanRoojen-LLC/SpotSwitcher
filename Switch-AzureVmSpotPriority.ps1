@@ -22,10 +22,11 @@ diagnostic settings, maintenance assignments, VM applications, and identities
 where Azure CLI can safely reapply them. It also returns stable source power
 states: running, stopped, or deallocated.
 
-Default mode is Plan, which performs discovery, writes a plan file, previews the
-commands, and then asks whether to execute that just-built plan. Execute mode
-requires an exact confirmation unless -Force is supplied for unattended
-automation.
+The default interactive flow performs discovery, writes a plan file, previews
+the commands, and then asks whether to run that just-built conversion. Nothing
+changes in Azure until the final exact confirmation is accepted. -Mode Execute
+keeps the preview and exact confirmation, but skips the post-preview run prompt
+for unattended or shortcut use.
 
 The opening menu can also clean up incremental snapshots created by SpotSwitcher.
 Cleanup lists matching snapshots first and requires exact confirmation before
@@ -34,7 +35,8 @@ deleting them.
 .EXAMPLE
 ./Switch-AzureVmSpotPriority.ps1
 
-Run the full interactive wizard in plan-only mode by default.
+Run the full interactive wizard. The wizard previews the plan before asking
+whether to run it.
 
 .EXAMPLE
 ./Switch-AzureVmSpotPriority.ps1 -Mode Execute -ResourceGroupName SOUTHCENTRAL-CORE.RG -VmName DC-SouthCentral
@@ -137,7 +139,7 @@ Interactive:
 Snapshot cleanup:
   ./Switch-AzureVmSpotPriority.ps1 -CleanupSnapshots
 
-Interactive execution:
+Shortcut to final confirmation after preview:
   ./Switch-AzureVmSpotPriority.ps1 -Mode Execute
 
 Unattended execution:
@@ -156,18 +158,23 @@ Interactive SKU selection:
   - Candidate SKUs are also filtered for source VM attachment/platform needs:
     data disks, NIC count, accelerated networking, Premium/Ultra storage,
     encryption at host, OS disk size, Hyper-V generation, and source zone.
-  - Use -TargetCores and -TargetMemoryGB to override that exact hardware shape.
+  - For Spot conversions, candidate SKUs must meet or exceed the source VM
+    vCPU/RAM shape, then browse results are sorted by lowest estimated whole
+    USD/month retail cost when the public Azure Retail Prices API returns a
+    match.
+  - For Regular conversions, candidate SKUs use the exact source VM vCPU/RAM
+    shape unless -TargetCores or -TargetMemoryGB override it.
 
 Direction is based on the source VM:
   Regular/null priority -> ToSpot
   Spot/Low priority    -> ToRegular
 
 Safety defaults:
-  - Plan mode is read-only until you explicitly choose to execute the previewed
-    plan and pass the exact confirmation prompt.
+  - The default wizard is read-only until you choose to run the previewed
+    conversion and pass the exact confirmation prompt.
   - Snapshot cleanup lists only snapshots with SpotSwitcher markers before
     requiring exact confirmation for deletion.
-  - Execute mode sets OS disk, data disks, and NIC deleteOption to Detach.
+  - The conversion run sets OS disk, data disks, and NIC deleteOption to Detach.
   - Dynamic private IPs can be pinned to static before wrapper deletion.
   - Incremental snapshots can be created after deallocation.
   - Source VM tags are captured in the saved plan and reapplied to the recreated
@@ -188,7 +195,7 @@ Safety defaults:
   - If an active Reserved VM Instance may be covering the source VM, SpotSwitcher
     warns and defaults to stopping because converting to Spot can strand or
     reassign that billing benefit.
-  - Execute mode requires exact typed confirmation unless -Force is supplied.
+  - Running the conversion requires exact typed confirmation unless -Force is supplied.
 '@
 }
 
@@ -549,7 +556,7 @@ function Read-MenuChoice {
 
         Write-Info ("Selected: {0}" -f $Option.Label)
         if ($Option.WaitDescription) {
-            Write-WarningLine $Option.WaitDescription
+            Write-Info $Option.WaitDescription
         }
 
         return $Option.Value
@@ -970,6 +977,87 @@ function ConvertTo-ReviewText {
     }
 
     return $text
+}
+
+function Copy-PlanValue {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    return ($Value | ConvertTo-Json -Depth 100 | ConvertFrom-Json -Depth 100)
+}
+
+function Set-RedactedPlanProperty {
+    param(
+        $Object,
+        [string]$PropertyName,
+        [string]$Reason
+    )
+
+    if ($null -eq $Object -or -not $Object.PSObject.Properties[$PropertyName]) {
+        return $false
+    }
+
+    $value = $Object.$PropertyName
+    if ($null -eq $value -or [string]::IsNullOrWhiteSpace([string]$value)) {
+        return $false
+    }
+
+    $Object.$PropertyName = "[REDACTED by SpotSwitcher: $Reason]"
+    return $true
+}
+
+function Get-PlanSafeVm {
+    param($Vm)
+
+    $safeVm = Copy-PlanValue -Value $Vm
+    $redactions = @()
+
+    if (Set-RedactedPlanProperty -Object $safeVm -PropertyName 'userData' -Reason 'VM user data may contain bootstrap secrets') {
+        $redactions += 'source.vm.userData'
+    }
+
+    if ($safeVm -and $safeVm.osProfile) {
+        if (Set-RedactedPlanProperty -Object $safeVm.osProfile -PropertyName 'customData' -Reason 'VM custom data may contain bootstrap secrets') {
+            $redactions += 'source.vm.osProfile.customData'
+        }
+    }
+
+    [pscustomobject]@{
+        Value      = $safeVm
+        Redactions = @($redactions)
+    }
+}
+
+function Get-PlanSafeExtensions {
+    param([object[]]$Extensions)
+
+    $safeExtensions = @()
+    $redactions = @()
+
+    foreach ($extension in @($Extensions)) {
+        $safeExtension = Copy-PlanValue -Value $extension
+        $extensionLabel = if ($safeExtension -and $safeExtension.name) { [string]$safeExtension.name } else { '<unnamed>' }
+
+        if (Set-RedactedPlanProperty -Object $safeExtension -PropertyName 'settings' -Reason 'extension settings may contain bootstrap material') {
+            $redactions += "source.extensions[$extensionLabel].settings"
+        }
+        if (Set-RedactedPlanProperty -Object $safeExtension -PropertyName 'protectedSettings' -Reason 'extension protected settings are sensitive') {
+            $redactions += "source.extensions[$extensionLabel].protectedSettings"
+        }
+        if (Set-RedactedPlanProperty -Object $safeExtension -PropertyName 'protectedSettingsFromKeyVault' -Reason 'extension protected settings references are sensitive') {
+            $redactions += "source.extensions[$extensionLabel].protectedSettingsFromKeyVault"
+        }
+
+        $safeExtensions += $safeExtension
+    }
+
+    [pscustomobject]@{
+        Value      = @($safeExtensions)
+        Redactions = @($redactions)
+    }
 }
 
 function New-ReviewOnlyItem {
@@ -1484,7 +1572,7 @@ function Resolve-ReservationSavingsImpact {
                 Value       = $true
             },
             [pscustomobject]@{
-                Label       = 'Stop without building commands'
+                Label       = 'Stop here'
                 Description = 'Recommended default. Leave Azure unchanged so you can review reservation savings first.'
                 Value       = $false
             }
@@ -1554,7 +1642,7 @@ function Resolve-ReviewOnlyItemsAction {
                 Value       = $true
             },
             [pscustomobject]@{
-                Label       = 'Stop without building commands'
+                Label       = 'Stop here'
                 Description = 'Leave Azure unchanged so you can review these settings first.'
                 Value       = $false
             }
@@ -2297,6 +2385,194 @@ function Format-MemoryGB {
     return $MemoryGB.ToString('0.##', [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
+function ConvertTo-ODataStringLiteral {
+    param([string]$Value)
+
+    return "'" + (($Value -replace "'", "''")) + "'"
+}
+
+function New-RetailPricesApiUrl {
+    param([string]$Filter)
+
+    $encodedFilter = [System.Uri]::EscapeDataString($Filter)
+    return "https://prices.azure.com/api/retail/prices?currencyCode=USD&%24filter=$encodedFilter"
+}
+
+function Get-RetailPriceItems {
+    param(
+        [string]$Location,
+        [string[]]$SkuNames
+    )
+
+    $uniqueNames = @($SkuNames | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    if ($uniqueNames.Count -eq 0) {
+        return @()
+    }
+
+    Write-Info "Reading Azure retail prices for $($uniqueNames.Count) SKU option(s)."
+    Write-WarningLine 'Retail prices are public Microsoft estimates normalized to whole USD/month at 730 hours and do not include your private discounts, reservations, savings plans, Azure Hybrid Benefit, taxes, or future Spot price changes.'
+
+    $items = @()
+    $batchSize = 15
+    for ($offset = 0; $offset -lt $uniqueNames.Count; $offset += $batchSize) {
+        $batch = @($uniqueNames | Select-Object -Skip $offset -First $batchSize)
+        $skuFilter = '(' + (@($batch | ForEach-Object { "armSkuName eq $(ConvertTo-ODataStringLiteral -Value $_)" }) -join ' or ') + ')'
+        $filter = "serviceName eq 'Virtual Machines' and armRegionName eq $(ConvertTo-ODataStringLiteral -Value $Location) and priceType eq 'Consumption' and $skuFilter"
+        $url = New-RetailPricesApiUrl -Filter $filter
+
+        while (-not [string]::IsNullOrWhiteSpace($url)) {
+            $response = Invoke-RestMethod -Uri $url -TimeoutSec 25 -ErrorAction Stop
+            $items += @($response.Items)
+            $url = [string]$response.NextPageLink
+        }
+    }
+
+    return $items
+}
+
+function Get-PriceMeterKind {
+    param($Item)
+
+    $text = "$($Item.meterName) $($Item.skuName)"
+    if ($text -match '\bSpot\b') {
+        return 'Spot'
+    }
+
+    if ($text -match 'Low Priority') {
+        return 'LowPriority'
+    }
+
+    return 'Regular'
+}
+
+function Test-PriceItemMatchesOs {
+    param(
+        $Item,
+        [string]$OsType
+    )
+
+    $isWindowsMeter = ([string]$Item.productName) -match 'Windows'
+    if ($OsType -eq 'Windows') {
+        return $isWindowsMeter
+    }
+
+    return (-not $isWindowsMeter)
+}
+
+function Select-SkuRetailPrice {
+    param(
+        [object[]]$Items,
+        [string]$SkuName,
+        [string]$ResolvedDirection,
+        [string]$OsType
+    )
+
+    $skuItems = @($Items | Where-Object {
+            $_.armSkuName -eq $SkuName -and
+            $_.type -eq 'Consumption' -and
+            $_.unitOfMeasure -eq '1 Hour' -and
+            (ConvertTo-DoubleOrNull -Value $_.retailPrice) -ne $null
+        })
+
+    if ($skuItems.Count -eq 0) {
+        return $null
+    }
+
+    $preferredKind = if ($ResolvedDirection -eq 'ToSpot') { 'Spot' } else { 'Regular' }
+    $directionItems = @($skuItems | Where-Object { (Get-PriceMeterKind -Item $_) -eq $preferredKind })
+    if ($ResolvedDirection -eq 'ToSpot' -and $directionItems.Count -eq 0) {
+        $directionItems = @($skuItems | Where-Object { (Get-PriceMeterKind -Item $_) -eq 'LowPriority' })
+    }
+
+    if ($directionItems.Count -eq 0) {
+        return $null
+    }
+
+    $osItems = @($directionItems | Where-Object { Test-PriceItemMatchesOs -Item $_ -OsType $OsType })
+    if ($osItems.Count -eq 0) {
+        $osItems = $directionItems
+    }
+
+    $selected = @($osItems | Sort-Object @{ Expression = { ConvertTo-DoubleOrNull -Value $_.retailPrice } }, productName, meterName | Select-Object -First 1)
+    if ($selected.Count -eq 0) {
+        return $null
+    }
+
+    $item = $selected[0]
+    $price = ConvertTo-DoubleOrNull -Value $item.retailPrice
+    $meterKind = Get-PriceMeterKind -Item $item
+    $osLabel = if (([string]$item.productName) -match 'Windows') { 'Windows' } else { 'Linux' }
+
+    [pscustomobject]@{
+        price       = $price
+        currency    = if ($item.currencyCode) { [string]$item.currencyCode } else { 'USD' }
+        meterKind   = $meterKind
+        osLabel     = $osLabel
+        meterName   = [string]$item.meterName
+        productName = [string]$item.productName
+    }
+}
+
+function Format-MonthlyRetailPrice {
+    param([double]$HourlyPrice)
+
+    $monthlyPrice = $HourlyPrice * 730
+    $roundedMonthlyPrice = [math]::Round($monthlyPrice, 0, [System.MidpointRounding]::AwayFromZero)
+    return '$' + $roundedMonthlyPrice.ToString('0', [System.Globalization.CultureInfo]::InvariantCulture) + '/mo'
+}
+
+function Format-SkuPriceDescription {
+    param($PriceInfo)
+
+    if (-not $PriceInfo -or $null -eq $PriceInfo.price) {
+        return 'Price: unavailable'
+    }
+
+    $kind = switch ($PriceInfo.meterKind) {
+        'Spot' { 'Spot retail'; break }
+        'LowPriority' { 'Low Priority retail'; break }
+        default { 'Regular retail' }
+    }
+
+    return "Price: $(Format-MonthlyRetailPrice -HourlyPrice $PriceInfo.price) USD est. ($kind, $($PriceInfo.osLabel), 730 hr/mo)"
+}
+
+function Add-SkuPricing {
+    param(
+        [object[]]$Candidates,
+        [string]$Location,
+        [string]$ResolvedDirection,
+        $SourceVm
+    )
+
+    $priceItems = @()
+    try {
+        $priceItems = @(Get-RetailPriceItems -Location $Location -SkuNames @($Candidates.name))
+    }
+    catch {
+        Write-WarningLine "Azure retail price lookup failed. SKU choices will remain visible with price marked unavailable. $($_.Exception.Message)"
+    }
+
+    $osType = [string]$SourceVm.storageProfile.osDisk.osType
+    return @($Candidates | ForEach-Object {
+            $priceInfo = Select-SkuRetailPrice -Items $priceItems -SkuName $_.name -ResolvedDirection $ResolvedDirection -OsType $osType
+            $priceSort = if ($priceInfo -and $null -ne $priceInfo.price) { [double]$priceInfo.price } else { [double]::MaxValue }
+            $priceDescription = Format-SkuPriceDescription -PriceInfo $priceInfo
+
+            [pscustomobject]@{
+                name             = $_.name
+                sku              = $_.sku
+                quotaDescription = $_.quotaDescription
+                quotaConfidence  = $_.quotaConfidence
+                score            = $_.score
+                priceInfo        = $priceInfo
+                priceSort        = $priceSort
+                priceDescription = $priceDescription
+                description      = "$priceDescription; $($_.quotaDescription)"
+            }
+        })
+}
+
 function Convert-MemoryMBToGB {
     param($MemoryMB)
 
@@ -2317,7 +2593,7 @@ function Convert-MemoryGBToMB {
 function Get-RegionalVmSizes {
     param([string]$Location)
 
-    Write-Info 'Reading Azure VM size list for exact CPU/RAM matching.'
+    Write-Info 'Reading Azure VM size list for CPU/RAM candidate matching.'
     Write-WarningLine 'This lightweight lookup narrows candidate names before the slower SKU metadata call.'
     return @(Invoke-AzJson -Arguments @(
             'vm', 'list-sizes',
@@ -2329,7 +2605,8 @@ function Get-RegionalVmSizes {
 function Read-TargetHardwareShape {
     param(
         [string]$CurrentSize,
-        $SourceSize
+        $SourceSize,
+        [string]$ResolvedDirection
     )
 
     $defaultCores = ConvertTo-IntOrNull -Value $SourceSize.numberOfCores
@@ -2402,7 +2679,12 @@ function Read-TargetHardwareShape {
     else {
         Write-Info "Using source VM shape: $cores vCPU / $memoryText GiB RAM."
     }
-    Write-WarningLine 'Only VM sizes with this exact vCPU and RAM shape will be considered before quota/SKU checks.'
+    if ($ResolvedDirection -eq 'ToSpot') {
+        Write-Info 'Spot conversion uses this as the minimum required shape, then sorts viable options by lowest estimated monthly cost.'
+    }
+    else {
+        Write-WarningLine 'Only VM sizes with this exact vCPU and RAM shape will be considered before quota/SKU checks.'
+    }
 
     return [pscustomobject]@{
         Cores    = $cores
@@ -2415,13 +2697,23 @@ function Get-CandidateVmSizeNames {
     param(
         [object[]]$Sizes,
         [int]$Cores,
-        [int]$MemoryMB
+        [int]$MemoryMB,
+        [switch]$Minimum
     )
 
     return @($Sizes |
         Where-Object {
-            (ConvertTo-IntOrNull -Value $_.numberOfCores) -eq $Cores -and
-            (ConvertTo-IntOrNull -Value $_.memoryInMB) -eq $MemoryMB
+            $candidateCores = ConvertTo-IntOrNull -Value $_.numberOfCores
+            $candidateMemoryMB = ConvertTo-IntOrNull -Value $_.memoryInMB
+            if ($null -eq $candidateCores -or $null -eq $candidateMemoryMB) {
+                $false
+            }
+            elseif ($Minimum) {
+                $candidateCores -ge $Cores -and $candidateMemoryMB -ge $MemoryMB
+            }
+            else {
+                $candidateCores -eq $Cores -and $candidateMemoryMB -eq $MemoryMB
+            }
         } |
         Select-Object -ExpandProperty name -Unique |
         Sort-Object)
@@ -2440,7 +2732,7 @@ function Get-SkuCatalog {
         $nameJson = ConvertTo-Json @($uniqueNames) -Compress
         $tick = [char]96
         $query = "[?resourceType=='virtualMachines' && contains($tick$nameJson$tick, name)].{name:name,family:family,restrictions:restrictions,capabilities:capabilities}"
-        $description = "Reading Azure VM SKU metadata for $($uniqueNames.Count) exact CPU/RAM candidate size name(s)."
+        $description = "Reading Azure VM SKU metadata for $($uniqueNames.Count) CPU/RAM candidate size name(s)."
     }
 
     Write-Info $description
@@ -2665,22 +2957,28 @@ function Select-PagedSku {
         [object[]]$Candidates
     )
 
-    $pageSize = 5
+    $pageSize = 10
     $offset = 0
 
     while ($true) {
         $page = @($Candidates | Select-Object -Skip $offset -First $pageSize)
         $options = foreach ($candidate in $page) {
+            $description = if ($candidate.PSObject.Properties['description'] -and -not [string]::IsNullOrWhiteSpace([string]$candidate.description)) {
+                [string]$candidate.description
+            }
+            else {
+                [string]$candidate.quotaDescription
+            }
             [pscustomobject]@{
                 Label       = $candidate.name
-                Description = $candidate.quotaDescription
+                Description = $description
                 Value       = $candidate.name
             }
         }
 
         if (($offset + $pageSize) -lt $Candidates.Count) {
             $options += [pscustomobject]@{
-                Label       = 'Show 5 more'
+                Label       = 'Show 10 more'
                 Description = "Showing $($offset + 1)-$($offset + $page.Count) of $($Candidates.Count)."
                 Value       = '__more__'
             }
@@ -2765,8 +3063,8 @@ function Select-StartupAction {
         -Options @(
             [pscustomobject]@{
                 Label           = 'Switch a VM between Regular and Spot'
-                Description     = 'Build a conversion plan, then optionally execute it after exact confirmation.'
-                WaitDescription = 'Next you choose plan-only or execute mode. Azure resources are still unchanged.'
+                Description     = 'Inspect a VM, preview the conversion commands, then decide whether to run them.'
+                WaitDescription = 'Next choose the subscription and source VM. Discovery is read-only.'
                 Value           = 'ConvertVm'
             },
             [pscustomobject]@{
@@ -2788,26 +3086,7 @@ function Select-RunMode {
         return $Mode
     }
 
-    if ($NonInteractive) {
-        return 'Plan'
-    }
-
-    return Read-MenuChoice `
-        -Title 'Run mode' `
-        -Default 1 `
-        -Options @(
-            [pscustomobject]@{
-                Label       = 'Plan only'
-                Description = 'Read-only discovery, saved plan, and command preview. Recommended first.'
-                Value       = 'Plan'
-            },
-            [pscustomobject]@{
-                Label           = 'Execute conversion'
-                Description     = 'Run the inferred Regular -> Spot or Spot -> Regular wrapper recreation after confirmation.'
-                WaitDescription = 'Next steps still do discovery and command preview first; Azure is not changed until the final exact confirmation.'
-                Value           = 'Execute'
-            }
-        )
+    return 'Plan'
 }
 
 function Select-Subscription {
@@ -3060,12 +3339,12 @@ function Show-InventorySummary {
     }
 
     if ($vm.storageProfile.osDisk.deleteOption -ne 'Detach') {
-        Write-WarningLine "OS disk deleteOption is '$($vm.storageProfile.osDisk.deleteOption)'. Execute mode will change it to Detach first."
+        Write-WarningLine "OS disk deleteOption is '$($vm.storageProfile.osDisk.deleteOption)'. The conversion run will change it to Detach first."
     }
 
     foreach ($nicRef in @($vm.networkProfile.networkInterfaces)) {
         if ($nicRef.deleteOption -ne 'Detach') {
-            Write-WarningLine "NIC reference '$($nicRef.id)' deleteOption is '$($nicRef.deleteOption)'. Execute mode will change it to Detach first."
+            Write-WarningLine "NIC reference '$($nicRef.id)' deleteOption is '$($nicRef.deleteOption)'. The conversion run will change it to Detach first."
         }
     }
 
@@ -3136,22 +3415,11 @@ function Select-Direction {
         "Source priority is '$priority', so the valid direction is Spot -> Regular."
     }
 
-    return Read-MenuChoice `
-        -Title 'Conversion direction' `
-        -Default 1 `
-        -Options @(
-            [pscustomobject]@{
-                Label           = $label
-                Description     = $description
-                WaitDescription = 'Next the wizard asks for target size and safety choices. Azure resources are still unchanged.'
-                Value           = $inferred
-            },
-            [pscustomobject]@{
-                Label       = 'Stop without building commands'
-                Description = 'Exit now. No Azure resources will be changed.'
-                Value       = 'Cancel'
-            }
-        )
+    Write-Section 'Conversion direction'
+    Write-Host $label -ForegroundColor White
+    Write-Info $description
+    Write-Info 'Next SpotSwitcher chooses the target size and safety settings. Azure resources are still unchanged.'
+    return $inferred
 }
 
 function Select-TargetSku {
@@ -3166,9 +3434,9 @@ function Select-TargetSku {
     }
 
     $currentSize = $Vm.hardwareProfile.vmSize
-    $title = if ($ResolvedDirection -eq 'ToSpot') { 'Spot VM SKU' } else { 'Regular VM SKU' }
+    $title = if ($ResolvedDirection -eq 'ToSpot') { 'Target Spot SKU' } else { 'Target Regular SKU' }
     $browseDescription = if ($ResolvedDirection -eq 'ToSpot') {
-        'Browse unrestricted, quota-eligible Spot-capable SKUs in this region.'
+        'Browse unrestricted, quota-eligible Spot-capable SKUs in this region. Sorted by lowest estimated monthly retail cost first.'
     }
     else {
         'Browse unrestricted, quota-eligible VM SKUs in this region.'
@@ -3193,14 +3461,21 @@ function Select-TargetSku {
         }
     }
 
-    $targetShape = Read-TargetHardwareShape -CurrentSize $currentSize -SourceSize $sourceSize
-    $candidateSizeNames = @(Get-CandidateVmSizeNames -Sizes $regionalSizes -Cores $targetShape.Cores -MemoryMB $targetShape.MemoryMB)
+    $targetShape = Read-TargetHardwareShape -CurrentSize $currentSize -SourceSize $sourceSize -ResolvedDirection $ResolvedDirection
+    $useMinimumShape = ($ResolvedDirection -eq 'ToSpot')
+    $candidateSizeNames = @(Get-CandidateVmSizeNames -Sizes $regionalSizes -Cores $targetShape.Cores -MemoryMB $targetShape.MemoryMB -Minimum:$useMinimumShape)
     if ($candidateSizeNames.Count -eq 0) {
-        Write-WarningLine "No VM sizes in $($Vm.location) exactly matched $($targetShape.Cores) vCPU / $(Format-MemoryGB -MemoryGB $targetShape.MemoryGB) GiB RAM. Falling back to manual entry."
+        $matchText = if ($useMinimumShape) { 'met or exceeded' } else { 'exactly matched' }
+        Write-WarningLine "No VM sizes in $($Vm.location) $matchText $($targetShape.Cores) vCPU / $(Format-MemoryGB -MemoryGB $targetShape.MemoryGB) GiB RAM. Falling back to manual entry."
         return (Read-RequiredText -Prompt 'Target VM size' -ExistingValue $null)
     }
 
-    Write-Info "Found $($candidateSizeNames.Count) VM size name(s) with the exact target shape before SKU metadata lookup."
+    if ($useMinimumShape) {
+        Write-Info "Found $($candidateSizeNames.Count) VM size name(s) that meet or exceed the target shape before SKU metadata lookup."
+    }
+    else {
+        Write-Info "Found $($candidateSizeNames.Count) VM size name(s) with the exact target shape before SKU metadata lookup."
+    }
 
     $catalogSizeNames = @($candidateSizeNames + @($currentSize) | Sort-Object -Unique)
     $allSkus = @(Get-SkuCatalog -Location $Vm.location -SizeNames $catalogSizeNames)
@@ -3239,25 +3514,38 @@ function Select-TargetSku {
     $targetSkus = @($allSkus | Where-Object { $candidateNameLookup.ContainsKey($_.name) })
     $targetSkus = @(Get-SourceCompatibleSkus -Skus $targetSkus -Requirements $sourceRequirements)
     $eligibleSkus = @(Get-QuotaEligibleSkus -Skus $targetSkus -Usages $quotaUsages -ResolvedDirection $ResolvedDirection -SourceSku $sourceSku -SourceVm $Vm)
-    $currentEligible = @($eligibleSkus | Where-Object { $_.name -eq $currentSize } | Select-Object -First 1)
-    $recommendedSku = @($eligibleSkus | Select-Object -First 1)
-
     if ($eligibleSkus.Count -eq 0) {
         Write-WarningLine 'No unrestricted quota-eligible SKUs were found. Falling back to manual entry.'
         return (Read-RequiredText -Prompt 'Target VM size' -ExistingValue $null)
     }
+    $eligibleSkus = @(Add-SkuPricing -Candidates $eligibleSkus -Location $Vm.location -ResolvedDirection $ResolvedDirection -SourceVm $Vm)
+    $currentEligible = @($eligibleSkus | Where-Object { $_.name -eq $currentSize } | Select-Object -First 1)
+    $browseSkus = if ($ResolvedDirection -eq 'ToSpot') {
+        @($eligibleSkus | Sort-Object quotaConfidence, priceSort, score, name)
+    }
+    else {
+        @($eligibleSkus | Sort-Object quotaConfidence, score, priceSort, name)
+    }
+    $recommendedSku = @($browseSkus | Select-Object -First 1)
 
-    $primarySkuOption = if ($currentEligible.Count -gt 0) {
+    $primarySkuOption = if ($ResolvedDirection -eq 'ToSpot' -and $recommendedSku.Count -gt 0) {
+        [pscustomobject]@{
+            Label       = "Use lowest-cost sufficient Spot size: $($recommendedSku[0].name)"
+            Description = "Meets or exceeds $($targetShape.Cores) vCPU / $(Format-MemoryGB -MemoryGB $targetShape.MemoryGB) GiB RAM. $($recommendedSku[0].description)"
+            Value       = $recommendedSku[0].name
+        }
+    }
+    elseif ($currentEligible.Count -gt 0) {
         [pscustomobject]@{
             Label       = "Keep current size: $currentSize"
-            Description = "Available for the target priority. $($currentEligible[0].quotaDescription)"
+            Description = "Available for the target priority. $($currentEligible[0].description)"
             Value       = $currentSize
         }
     }
     elseif ($recommendedSku.Count -gt 0) {
         [pscustomobject]@{
             Label       = "Use closest available size: $($recommendedSku[0].name)"
-            Description = "Current size '$currentSize' was not available for target priority/quota. $($recommendedSku[0].quotaDescription)"
+            Description = "Current size '$currentSize' was not available for target priority/quota. $($recommendedSku[0].description)"
             Value       = $recommendedSku[0].name
         }
     }
@@ -3272,9 +3560,9 @@ function Select-TargetSku {
 
     $menuOptions += @(
         [pscustomobject]@{
-            Label           = 'Browse discovered SKUs'
+            Label           = 'Browse eligible SKUs'
             Description     = $browseDescription
-            WaitDescription = 'The browser shows 5 SKUs at a time so Cloud Shell stays readable.'
+            WaitDescription = 'The SKU list shows 10 options at a time so Cloud Shell stays readable.'
             Value           = 'browse'
         },
         [pscustomobject]@{
@@ -3299,10 +3587,10 @@ function Select-TargetSku {
 
     $filter = ''
     if (-not $NonInteractive) {
-        $filter = Read-Host 'Filter SKU names, or press Enter for the first 5 matches'
+        $filter = Read-Host 'Filter SKU names, or press Enter for the 10 lowest-cost matches'
     }
 
-    $skus = $eligibleSkus
+    $skus = $browseSkus
     if (-not [string]::IsNullOrWhiteSpace($filter)) {
         $skus = @($skus | Where-Object { $_.name -like "*$filter*" })
     }
@@ -3312,7 +3600,7 @@ function Select-TargetSku {
         return (Read-RequiredText -Prompt 'Target VM size' -ExistingValue $null)
     }
 
-    return (Select-PagedSku -Title "Choose $title" -Candidates $skus)
+    return (Select-PagedSku -Title $title -Candidates $skus)
 }
 
 function Test-TargetSku {
@@ -3361,22 +3649,8 @@ function Resolve-SkuValidation {
         return $false
     }
 
-    return Read-MenuChoice `
-        -Title 'SKU validation' `
-        -Default 1 `
-        -Options @(
-            [pscustomobject]@{
-                Label       = 'Skip live SKU validation'
-                Description = 'Fastest. Azure will still validate the SKU during create. Recommended unless you want an extra capability check.'
-                Value       = $false
-            },
-            [pscustomobject]@{
-                Label           = 'Run live SKU validation'
-                Description     = 'Calls az vm list-skus for the chosen size. Can take a while in some tenants.'
-                WaitDescription = 'This validation call can take up to a minute, but it catches some SKU restrictions before execution.'
-                Value           = $true
-            }
-        )
+    Write-Info 'Skipping optional live SKU validation. Azure still validates the SKU during VM creation; pass -ValidateSku Yes to add that preflight.'
+    return $false
 }
 
 function Get-DynamicPrivateIpConfigs {
@@ -3486,7 +3760,7 @@ function Resolve-AvailabilitySetAction {
                 Value       = $true
             },
             [pscustomobject]@{
-                Label       = 'Stop without building commands'
+                Label       = 'Stop here'
                 Description = 'Keep the VM in its availability set and leave Azure unchanged.'
                 Value       = $false
             }
@@ -3560,7 +3834,7 @@ function Resolve-ReservedPlacementAction {
                 Value       = $true
             },
             [pscustomobject]@{
-                Label       = 'Stop without building commands'
+                Label       = 'Stop here'
                 Description = 'Keep reserved placement unchanged and leave Azure unchanged.'
                 Value       = $false
             }
@@ -3571,6 +3845,91 @@ function Resolve-ReservedPlacementAction {
     }
 
     Write-Fail 'Stopped because Spot conversion cannot preserve reserved placement.'
+}
+
+function Resolve-SpotSettings {
+    $resolvedEvictionPolicy = $EvictionPolicy
+    $resolvedMaxPrice = $MaxPrice
+
+    if (-not $resolvedEvictionPolicy -and -not $resolvedMaxPrice) {
+        if ($NonInteractive) {
+            return [pscustomobject]@{
+                EvictionPolicy = 'Deallocate'
+                MaxPrice       = '-1'
+            }
+        }
+
+        $spotBehaviorChoice = Read-MenuChoice `
+            -Title 'Spot behavior' `
+            -Default 1 `
+            -Options @(
+                [pscustomobject]@{
+                    Label       = 'Use recommended Spot behavior'
+                    Description = 'Eviction policy Deallocate and max price -1. Azure evicts only for capacity, not price.'
+                    Value       = 'recommended'
+                },
+                [pscustomobject]@{
+                    Label       = 'Customize Spot behavior'
+                    Description = 'Choose Delete/Deallocate and optionally set a custom hourly max price.'
+                    Value       = 'custom'
+                }
+            )
+
+        if ($spotBehaviorChoice -eq 'recommended') {
+            return [pscustomobject]@{
+                EvictionPolicy = 'Deallocate'
+                MaxPrice       = '-1'
+            }
+        }
+    }
+
+    if (-not $resolvedEvictionPolicy) {
+        $resolvedEvictionPolicy = Read-MenuChoice `
+            -Title 'Spot eviction policy' `
+            -Default 1 `
+            -Options @(
+                [pscustomobject]@{
+                    Label       = 'Deallocate'
+                    Description = 'Recommended for stateful VMs. Preserves disks and NICs on eviction.'
+                    Value       = 'Deallocate'
+                },
+                [pscustomobject]@{
+                    Label       = 'Delete'
+                    Description = 'Deletes the VM on eviction. Only choose this for disposable VMs.'
+                    Value       = 'Delete'
+                }
+            )
+    }
+
+    if (-not $resolvedMaxPrice) {
+        $maxPriceChoice = Read-MenuChoice `
+            -Title 'Spot max price' `
+            -Default 1 `
+            -Options @(
+                [pscustomobject]@{
+                    Label       = '-1'
+                    Description = 'Recommended. Do not evict for price reasons, only capacity.'
+                    Value       = '-1'
+                },
+                [pscustomobject]@{
+                    Label       = 'Enter custom max price'
+                    Description = 'Dollar amount per hour. Azure may evict when Spot price exceeds this.'
+                    Value       = 'custom'
+                }
+            )
+
+        if ($maxPriceChoice -eq 'custom') {
+            $resolvedMaxPrice = Read-RequiredText -Prompt 'Max price, such as 0.25' -ExistingValue $null
+        }
+        else {
+            $resolvedMaxPrice = $maxPriceChoice
+        }
+    }
+
+    return [pscustomobject]@{
+        EvictionPolicy = $resolvedEvictionPolicy
+        MaxPrice       = $resolvedMaxPrice
+    }
 }
 
 function Select-Decisions {
@@ -3592,54 +3951,9 @@ function Select-Decisions {
     $resolvedEvictionPolicy = $null
     $resolvedMaxPrice = $null
     if ($ResolvedDirection -eq 'ToSpot') {
-        $resolvedEvictionPolicy = if ($EvictionPolicy) {
-            $EvictionPolicy
-        }
-        else {
-            Read-MenuChoice `
-                -Title 'Spot eviction policy' `
-                -Default 1 `
-                -Options @(
-                    [pscustomobject]@{
-                        Label       = 'Deallocate'
-                        Description = 'Recommended for stateful VMs. Preserves disks and NICs on eviction.'
-                        Value       = 'Deallocate'
-                    },
-                    [pscustomobject]@{
-                        Label       = 'Delete'
-                        Description = 'Deletes the VM on eviction. Only choose this for disposable VMs.'
-                        Value       = 'Delete'
-                    }
-                )
-        }
-
-        $resolvedMaxPrice = if ($MaxPrice) {
-            $MaxPrice
-        }
-        else {
-            $maxPriceChoice = Read-MenuChoice `
-                -Title 'Spot max price' `
-                -Default 1 `
-                -Options @(
-                    [pscustomobject]@{
-                        Label       = '-1'
-                        Description = 'Recommended. Do not evict for price reasons, only capacity.'
-                        Value       = '-1'
-                    },
-                    [pscustomobject]@{
-                        Label       = 'Enter custom max price'
-                        Description = 'Dollar amount per hour. Azure may evict when Spot price exceeds this.'
-                        Value       = 'custom'
-                    }
-                )
-
-            if ($maxPriceChoice -eq 'custom') {
-                Read-RequiredText -Prompt 'Max price, such as 0.25' -ExistingValue $null
-            }
-            else {
-                $maxPriceChoice
-            }
-        }
+        $spotSettings = Resolve-SpotSettings
+        $resolvedEvictionPolicy = $spotSettings.EvictionPolicy
+        $resolvedMaxPrice = $spotSettings.MaxPrice
     }
 
     $dynamicIpConfigs = @(Get-DynamicPrivateIpConfigs -Nics $Inventory.nics)
@@ -3658,11 +3972,11 @@ function Select-Decisions {
     $createSnapshotsValue = Resolve-YesNo `
         -Value $CreateSnapshots `
         -DefaultWhenAuto $true `
-        -Title 'Snapshot insurance' `
+        -Title 'Disk snapshot safety' `
         -YesLabel 'Create incremental disk snapshots after deallocation' `
-        -YesDescription 'Recommended. Same-disk recreation remains primary; snapshots are extra insurance.' `
+        -YesDescription 'Recommended. The conversion still reuses the original disks; snapshots are a recovery fallback.' `
         -NoLabel 'Skip snapshots' `
-        -NoDescription 'Fastest path, but removes the extra disk-level recovery option.'
+        -NoDescription 'Fastest path, but removes the extra disk recovery fallback.'
 
     return [pscustomobject]@{
         direction        = $ResolvedDirection
@@ -3689,9 +4003,12 @@ function New-Plan {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     $vm = $Inventory.vm
     $sourcePowerStateCode = Get-VmPowerStateCode -InstanceView $Inventory.instanceView
+    $planSafeVm = Get-PlanSafeVm -Vm $Inventory.vm
+    $planSafeExtensions = Get-PlanSafeExtensions -Extensions $Inventory.extensions
+    $sensitiveRedactions = @($planSafeVm.Redactions + $planSafeExtensions.Redactions)
 
     [ordered]@{
-        planVersion = 6
+        planVersion = 7
         generatedAt = (Get-Date).ToString('o')
         planId = "$($vm.name)-$($Decisions.direction)-$stamp"
         subscription = @{
@@ -3700,10 +4017,11 @@ function New-Plan {
             tenantId = $Account.tenantId
         }
         source = @{
-            vm = $Inventory.vm
+            vm = $planSafeVm.Value
             tags = ConvertTo-TagObject -Tags $Inventory.vm.tags
             instanceView = $Inventory.instanceView
-            extensions = $Inventory.extensions
+            extensions = $planSafeExtensions.Value
+            sensitiveRedactions = @($sensitiveRedactions)
             vmLocks = $Inventory.vmLocks
             inheritedLocks = $Inventory.inheritedLocks
             diagnosticSettings = $Inventory.diagnosticSettings
@@ -3740,7 +4058,7 @@ function Save-Plan {
 
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $Plan | ConvertTo-Json -Depth 100 | Set-Content -Path $path -Encoding utf8
-    Write-Section 'Saved plan'
+    Write-Section 'Saved conversion plan'
     Write-Host $path -ForegroundColor White
     return $path
 }
@@ -4341,7 +4659,7 @@ function Get-SwitchCommands {
 function Show-CommandPreview {
     param([object[]]$Commands)
 
-    Write-Section 'Command preview'
+    Write-Section 'Conversion command preview'
     foreach ($command in $Commands) {
         Write-Host ''
         Write-Host $command.Description -ForegroundColor Green
@@ -4355,28 +4673,28 @@ function Resolve-ExecutePreviewedPlan {
         [string]$RerunCommand
     )
 
-    Write-Section 'Plan complete'
-    Write-Host 'No Azure resources have been changed yet.'
-    Write-Host "Saved plan: $SavedPlanPath"
-    Write-Host "To rebuild and execute this flow later, run: $RerunCommand"
+    Write-Section 'Review complete'
+    Write-Host 'Azure resources have not been changed.'
+    Write-Host "Saved conversion plan: $SavedPlanPath"
+    Write-Host "To rebuild and run this conversion later: $RerunCommand"
 
     if ($NonInteractive) {
         return $false
     }
 
     return Read-MenuChoice `
-        -Title 'Execute previewed plan' `
+        -Title 'Run this conversion?' `
         -Default 2 `
         -Options @(
             [pscustomobject]@{
-                Label           = 'Execute this plan now'
-                Description     = 'Run the commands shown above after the final exact confirmation prompt.'
-                WaitDescription = 'Next you must type the exact confirmation phrase. Azure resources are still unchanged until that confirmation passes.'
+                Label           = 'Run now'
+                Description     = 'Run the previewed commands after the final exact confirmation prompt.'
+                WaitDescription = 'Next type the exact confirmation phrase. Nothing changes unless it matches.'
                 Value           = $true
             },
             [pscustomobject]@{
-                Label       = 'Stop with saved plan'
-                Description = 'Keep the saved plan and command preview. No Azure resources will be changed.'
+                Label       = 'Stop here'
+                Description = 'Keep the saved plan and command preview. No Azure resources have been changed.'
                 Value       = $false
             }
         )
@@ -4385,7 +4703,7 @@ function Resolve-ExecutePreviewedPlan {
 function Show-DecisionSummary {
     param($Plan)
 
-    Write-Section 'Decision summary'
+    Write-Section 'Conversion summary'
     Write-Host ("Direction:        {0}" -f $Plan.decisions.direction)
     Write-Host ("Target SKU:       {0}" -f $Plan.decisions.targetSku)
     Write-Host ("VM tags:          Preserve {0} source tag(s)" -f @(ConvertTo-TagPairs -Tags (Get-PlanSourceTags -Plan $Plan)).Count)
@@ -4474,9 +4792,9 @@ function Invoke-Main {
         $rerunCommand = './Switch-AzureVmSpotPriority.ps1 -Mode Execute'
         $shouldExecute = Resolve-ExecutePreviewedPlan -SavedPlanPath $savedPlanPath -RerunCommand $rerunCommand
         if (-not $shouldExecute) {
-            Write-Section 'Plan only'
-            Write-Host 'No changes were made.'
-            Write-Host "Saved plan: $savedPlanPath"
+            Write-Section 'Stopped before changes'
+            Write-Host 'No Azure resources were changed.'
+            Write-Host "Saved conversion plan: $savedPlanPath"
             return
         }
     }
@@ -4496,7 +4814,7 @@ function Invoke-Main {
     ) -Description 'Reading recreated VM summary.'
 
     Write-Section 'Done'
-    Write-Host "Conversion completed. Saved plan: $savedPlanPath"
+    Write-Host "Conversion completed. Saved conversion plan: $savedPlanPath"
 }
 
 Invoke-Main
