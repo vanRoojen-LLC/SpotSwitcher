@@ -47,7 +47,10 @@ SpotSwitcher does not guarantee Azure Spot capacity, prevent future eviction,
 bypass Azure policy, or reserve quota. It runs under the user's Azure identity
 and generates a dry-run plan by default. The script does not send VM inventory,
 subscription data, tenant data, plan files, secrets, or telemetry to vanRoojen
-LLC.
+LLC by default. If optional email notifications are configured, it sends only
+the notification payload to Toby's shared Cloudflare Email Sender Worker and
+keeps subscriber decisions, message content, and recipient selection inside
+SpotSwitcher.
 Saved plans redact VM user data, osProfile custom data, and VM extension
 settings, but still contain Azure resource IDs and operational metadata.
 For stable source states, conversion returns the VM to the original power state:

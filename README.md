@@ -121,6 +121,47 @@ minimum capacity target, while Regular conversions use the exact source shape.
 Pass `-TargetCores` and `-TargetMemoryGB` to override that shape before
 browsing candidate SKUs.
 
+## Optional Email Notifications
+
+SpotSwitcher can send opt-in run notifications through Toby's shared
+Cloudflare Email Sender Worker. SpotSwitcher still owns notification decisions,
+recipient selection, message content, and per-recipient fan-out; the Worker is
+only the signed delivery transport.
+
+Set these values where the script runs:
+
+```powershell
+$env:CFES_ENDPOINT = 'https://cloudflare-email-sender.toby-vanroojen.workers.dev/v1/send'
+$env:CFES_CLIENT_ID = 'spotswitcher'
+$env:CFES_HMAC_SECRET = '<hydrated-from-key-vault>'
+$env:SPOTSWITCHER_NOTIFICATION_TO = 'ops@example.com'
+```
+
+You can also pass recipients explicitly:
+
+```powershell
+./Switch-AzureVmSpotPriority.ps1 -NotificationEmailTo ops@example.com
+```
+
+Multiple recipients can be separated with commas or semicolons. SpotSwitcher
+sends one signed CFES API request per recipient because the Worker payload uses
+a single `to` address. The Worker health endpoint is
+<https://cloudflare-email-sender.toby-vanroojen.workers.dev/health>.
+
+Do not put `CFES_HMAC_SECRET` in the repository or in command history. All
+SpotSwitcher secrets must live in Azure Key Vault
+`/subscriptions/fb45451c-66aa-44de-9c41-35d17665ff46/resourceGroups/rg-shared-services/providers/Microsoft.KeyVault/vaults/tvr-shared-tv001-kv`.
+The CFES maintainer creates the real per-client HMAC secret in that Key Vault,
+installs it on the shared Worker, and hydrates the app runtime secret target as
+`CFES_HMAC_SECRET`.
+
+Requested Worker-side sender policy:
+
+- Sender email address: `notifications@spotswitcher.app`
+- Sender display name: `SpotSwitcher`
+- Reply-to address: `contact@vanroojen.com`
+- Allowed sender domain: `spotswitcher.app`
+
 The script writes plan files to `~/clouddrive/SpotSwitcherPlans` in Cloud Shell
 when Cloud Drive is mounted, otherwise to `./SpotSwitcherPlans`.
 Plan files can contain Azure resource IDs, VM configuration metadata, and

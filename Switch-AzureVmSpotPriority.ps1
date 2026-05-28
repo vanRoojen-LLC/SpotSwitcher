@@ -68,6 +68,16 @@ Run unattended with explicit choices.
 
 List snapshots created by SpotSwitcher in the active subscription, then require
 exact confirmation before deleting them.
+
+.EXAMPLE
+$env:CFES_ENDPOINT = 'https://cloudflare-email-sender.toby-vanroojen.workers.dev/v1/send'
+$env:CFES_CLIENT_ID = 'spotswitcher'
+$env:CFES_HMAC_SECRET = '<hydrated-from-key-vault>'
+./Switch-AzureVmSpotPriority.ps1 -NotificationEmailTo ops@example.com
+
+Send opt-in run notifications through Toby's shared Cloudflare Email Sender
+Worker. SpotSwitcher owns when notifications are sent and sends one signed CFES
+request per recipient.
 #>
 
 [CmdletBinding()]
@@ -125,13 +135,15 @@ param(
     [ValidateRange(5, 300)]
     [int]$PowerStatePollSeconds = 15,
 
+    [string[]]$NotificationEmailTo,
+
     [switch]$NonInteractive,
     [switch]$Force,
     [switch]$Help
 )
 
 $ErrorActionPreference = 'Stop'
-$Script:SpotSwitcherVersion = '0.8.1'
+$Script:SpotSwitcherVersion = '0.9.0'
 $Script:SpotSwitcherPlanVersion = 8
 $Script:SpotSkuCandidateLimit = 160
 
@@ -208,6 +220,9 @@ Safety defaults:
   - Source VM lookup can search by name prefix and returns all matching VMs in a
     10-at-a-time pick list.
   - Running the conversion requires exact typed confirmation unless -Force is supplied.
+  - Optional notifications can be sent through Toby's shared Cloudflare Email
+    Sender Worker. Set CFES_ENDPOINT, CFES_CLIENT_ID, CFES_HMAC_SECRET, and
+    pass -NotificationEmailTo or SPOTSWITCHER_NOTIFICATION_TO.
 '@
 }
 
@@ -477,6 +492,367 @@ function New-ActionCommand {
         Kind        = 'Action'
         PreviewLines = @($PreviewLines)
         ScriptBlock = $ScriptBlock.GetNewClosure()
+    }
+}
+
+function New-CfesEmailPayload {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$To,
+        [Parameter(Mandatory = $true)]
+        [string]$Subject,
+        [Parameter(Mandatory = $true)]
+        [string]$Text,
+        [string]$Html,
+        [Parameter(Mandatory = $true)]
+        [string]$EventName
+    )
+
+    $payload = [ordered]@{
+        to      = $To
+        subject = $Subject
+        text    = $Text
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Html)) {
+        $payload['html'] = $Html
+    }
+    $payload['metadata'] = [ordered]@{
+        project = 'SpotSwitcher'
+        event   = $EventName
+    }
+
+    return $payload
+}
+
+function New-CfesSignedRequest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Payload,
+        [Parameter(Mandatory = $true)]
+        [string]$Endpoint,
+        [Parameter(Mandatory = $true)]
+        [string]$ClientId,
+        [Parameter(Mandatory = $true)]
+        [string]$Secret,
+        [long]$Timestamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds(),
+        [string]$Nonce = [guid]::NewGuid().ToString()
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Endpoint)) {
+        Write-Fail 'CFES_ENDPOINT is required before sending email notifications.'
+    }
+    if ([string]::IsNullOrWhiteSpace($ClientId)) {
+        Write-Fail 'CFES_CLIENT_ID is required before sending email notifications.'
+    }
+    if ([string]::IsNullOrWhiteSpace($Secret)) {
+        Write-Fail 'CFES_HMAC_SECRET is required before sending email notifications.'
+    }
+    if ([string]::IsNullOrWhiteSpace($Nonce)) {
+        Write-Fail 'CFES nonce generation failed.'
+    }
+
+    $rawJsonBody = $Payload | ConvertTo-Json -Depth 20 -Compress
+    $message = '{0}.{1}.{2}' -f $Timestamp, $Nonce, $rawJsonBody
+    $keyBytes = [System.Text.Encoding]::UTF8.GetBytes($Secret)
+    $messageBytes = [System.Text.Encoding]::UTF8.GetBytes($message)
+    $hmac = [System.Security.Cryptography.HMACSHA256]::new($keyBytes)
+    try {
+        $signatureBytes = $hmac.ComputeHash($messageBytes)
+    }
+    finally {
+        $hmac.Dispose()
+    }
+
+    $signatureHex = -join ($signatureBytes | ForEach-Object { $_.ToString('x2') })
+
+    [pscustomobject]@{
+        Endpoint    = $Endpoint
+        RawJsonBody = $rawJsonBody
+        Headers     = [ordered]@{
+            'content-type'     = 'application/json'
+            'X-CFES-Client'    = $ClientId
+            'X-CFES-Timestamp' = [string]$Timestamp
+            'X-CFES-Nonce'     = $Nonce
+            'X-CFES-Signature' = "sha256=$signatureHex"
+        }
+    }
+}
+
+function Resolve-CfesConfiguration {
+    $endpoint = [string]$env:CFES_ENDPOINT
+    $clientId = [string]$env:CFES_CLIENT_ID
+    $secret = [string]$env:CFES_HMAC_SECRET
+
+    if ([string]::IsNullOrWhiteSpace($endpoint)) {
+        Write-Fail 'CFES_ENDPOINT is required before sending email notifications.'
+    }
+    if ([string]::IsNullOrWhiteSpace($clientId)) {
+        Write-Fail 'CFES_CLIENT_ID is required before sending email notifications.'
+    }
+    if ([string]::IsNullOrWhiteSpace($secret)) {
+        Write-Fail 'CFES_HMAC_SECRET is required before sending email notifications.'
+    }
+
+    [pscustomobject]@{
+        Endpoint = $endpoint
+        ClientId = $clientId
+        Secret   = $secret
+    }
+}
+
+function Get-CfesWorkerErrorCode {
+    param([string]$Body)
+
+    if ([string]::IsNullOrWhiteSpace($Body)) {
+        return '<none>'
+    }
+
+    try {
+        $json = $Body | ConvertFrom-Json -Depth 20
+        if ($json.error -and $json.error.code) {
+            return [string]$json.error.code
+        }
+        if ($json.code) {
+            return [string]$json.code
+        }
+        if ($json.errorCode) {
+            return [string]$json.errorCode
+        }
+    }
+    catch {
+    }
+
+    return '<unparseable>'
+}
+
+function Invoke-CfesEmailTransport {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Payload,
+        [Parameter(Mandatory = $true)]
+        [string]$EventName
+    )
+
+    $config = Resolve-CfesConfiguration
+    $request = New-CfesSignedRequest -Payload $Payload -Endpoint $config.Endpoint -ClientId $config.ClientId -Secret $config.Secret
+
+    try {
+        $response = Invoke-WebRequest `
+            -Uri $request.Endpoint `
+            -Method Post `
+            -Headers $request.Headers `
+            -Body $request.RawJsonBody `
+            -TimeoutSec 30 `
+            -ErrorAction Stop
+
+        $statusCode = [int]$response.StatusCode
+        Write-Info ("CFES email event '{0}' sent for client '{1}' to 1 recipient(s); worker status {2}." -f $EventName, $config.ClientId, $statusCode)
+        return [pscustomobject]@{
+            StatusCode = $statusCode
+            ClientId   = $config.ClientId
+            EventName  = $EventName
+        }
+    }
+    catch {
+        $statusCode = '<unknown>'
+        if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+            $statusCode = [int]$_.Exception.Response.StatusCode
+        }
+
+        $body = ''
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $body = [string]$_.ErrorDetails.Message
+        }
+        $workerErrorCode = Get-CfesWorkerErrorCode -Body $body
+
+        Write-WarningLine ("CFES email event '{0}' failed for client '{1}' to 1 recipient(s); worker status {2}; worker error code {3}." -f $EventName, $config.ClientId, $statusCode, $workerErrorCode)
+        throw
+    }
+}
+
+function Get-SpotSwitcherNotificationRecipients {
+    param([string[]]$ExplicitRecipients)
+
+    $rawRecipients = @()
+    if (@($ExplicitRecipients).Count -gt 0) {
+        $rawRecipients += @($ExplicitRecipients)
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:SPOTSWITCHER_NOTIFICATION_TO)) {
+        $rawRecipients += ([string]$env:SPOTSWITCHER_NOTIFICATION_TO -split '[,;]')
+    }
+
+    $seen = @{}
+    $recipients = @()
+    foreach ($rawRecipient in $rawRecipients) {
+        foreach ($piece in ([string]$rawRecipient -split '[,;]')) {
+            $recipient = $piece.Trim()
+            if ([string]::IsNullOrWhiteSpace($recipient)) {
+                continue
+            }
+            if ($seen.ContainsKey($recipient.ToLowerInvariant())) {
+                continue
+            }
+
+            $seen[$recipient.ToLowerInvariant()] = $true
+            $recipients += $recipient
+        }
+    }
+
+    return $recipients
+}
+
+function Format-NotificationValue {
+    param(
+        [string]$Label,
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $null
+    }
+
+    return ('{0}: {1}' -f $Label, $Value)
+}
+
+function Limit-NotificationText {
+    param(
+        [string]$Text,
+        [int]$MaxLength = 1200
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return '<none>'
+    }
+
+    $normalized = ($Text -replace '\s+', ' ').Trim()
+    if ($normalized.Length -le $MaxLength) {
+        return $normalized
+    }
+
+    return $normalized.Substring(0, $MaxLength - 3) + '...'
+}
+
+function New-SpotSwitcherNotificationContent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('PlanPrepared', 'ConversionCompleted', 'ConversionFailed')]
+        [string]$Kind,
+        $Plan,
+        [string]$SavedPlanPath,
+        [string]$Stage,
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $vmName = [string]$Plan.source.vm.name
+    if ([string]::IsNullOrWhiteSpace($vmName)) {
+        $vmName = '<unknown VM>'
+    }
+    $resourceGroup = [string]$Plan.source.vm.resourceGroup
+    $subscription = [string]$Plan.account.name
+    if ([string]::IsNullOrWhiteSpace($subscription)) {
+        $subscription = [string]$Plan.account.id
+    }
+    $direction = [string]$Plan.decisions.direction
+    $targetSku = [string]$Plan.decisions.targetSku
+    $finalPower = [string]$Plan.source.powerState.restoreSummary
+
+    $eventName = switch ($Kind) {
+        'PlanPrepared' { 'conversion.plan_prepared'; break }
+        'ConversionCompleted' { 'conversion.completed'; break }
+        'ConversionFailed' { 'conversion.failed'; break }
+    }
+    $subject = switch ($Kind) {
+        'PlanPrepared' { "[SpotSwitcher] Plan prepared for $vmName"; break }
+        'ConversionCompleted' { "[SpotSwitcher] Conversion completed for $vmName"; break }
+        'ConversionFailed' { "[SpotSwitcher] Conversion failed for $vmName"; break }
+    }
+
+    $lines = @()
+    $lines += Format-NotificationValue -Label 'Event' -Value $eventName
+    $lines += Format-NotificationValue -Label 'VM' -Value $vmName
+    $lines += Format-NotificationValue -Label 'Resource group' -Value $resourceGroup
+    $lines += Format-NotificationValue -Label 'Subscription' -Value $subscription
+    $lines += Format-NotificationValue -Label 'Direction' -Value $direction
+    $lines += Format-NotificationValue -Label 'Target SKU' -Value $targetSku
+    $lines += Format-NotificationValue -Label 'Final power state' -Value $finalPower
+    $lines += Format-NotificationValue -Label 'Saved plan' -Value $SavedPlanPath
+    if ($Kind -eq 'ConversionFailed') {
+        $lines += Format-NotificationValue -Label 'Stage' -Value $Stage
+        if ($ErrorRecord) {
+            $lines += Format-NotificationValue -Label 'Error' -Value (Limit-NotificationText -Text $ErrorRecord.Exception.Message)
+        }
+    }
+
+    [pscustomobject]@{
+        EventName = $eventName
+        Subject   = $subject
+        Text      = (($lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n")
+    }
+}
+
+function Send-SpotSwitcherNotification {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('PlanPrepared', 'ConversionCompleted', 'ConversionFailed')]
+        [string]$Kind,
+        [string[]]$Recipients,
+        $Plan,
+        [string]$SavedPlanPath,
+        [string]$Stage,
+        [System.Management.Automation.ErrorRecord]$ErrorRecord,
+        [scriptblock]$Transport
+    )
+
+    $resolvedRecipients = @(Get-SpotSwitcherNotificationRecipients -ExplicitRecipients $Recipients)
+    if ($resolvedRecipients.Count -eq 0) {
+        return @()
+    }
+
+    if (-not $Transport) {
+        $Transport = {
+            param($Payload, $EventName)
+            Invoke-CfesEmailTransport -Payload $Payload -EventName $EventName
+        }
+    }
+
+    $content = New-SpotSwitcherNotificationContent -Kind $Kind -Plan $Plan -SavedPlanPath $SavedPlanPath -Stage $Stage -ErrorRecord $ErrorRecord
+    $results = @()
+    foreach ($recipient in $resolvedRecipients) {
+        $payload = New-CfesEmailPayload `
+            -To $recipient `
+            -Subject $content.Subject `
+            -Text $content.Text `
+            -EventName $content.EventName
+
+        $results += (& $Transport $payload $content.EventName)
+    }
+
+    return $results
+}
+
+function Send-SpotSwitcherNotificationSafe {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('PlanPrepared', 'ConversionCompleted', 'ConversionFailed')]
+        [string]$Kind,
+        [string[]]$Recipients,
+        $Plan,
+        [string]$SavedPlanPath,
+        [string]$Stage,
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    try {
+        [void](Send-SpotSwitcherNotification `
+                -Kind $Kind `
+                -Recipients $Recipients `
+                -Plan $Plan `
+                -SavedPlanPath $SavedPlanPath `
+                -Stage $Stage `
+                -ErrorRecord $ErrorRecord)
+    }
+    catch {
+        Write-WarningLine "SpotSwitcher could not send the optional $Kind email notification: $($_.Exception.Message)"
     }
 }
 
@@ -5263,78 +5639,110 @@ function Show-DecisionSummary {
 }
 
 function Invoke-Main {
-    if ($Help) {
-        Show-Usage
-        return
-    }
+    $notificationRecipients = @(Get-SpotSwitcherNotificationRecipients -ExplicitRecipients $NotificationEmailTo)
+    $notificationStage = 'startup'
+    $plan = $null
+    $savedPlanPath = $null
 
-    if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-        Write-Fail 'Azure CLI was not found. Run this in Azure Cloud Shell or install az.'
-    }
-
-    $startupAction = Select-StartupAction
-    if ($startupAction -eq 'Stop') {
-        Write-Section 'Stopped'
-        Write-Host 'No Azure resources were changed.'
-        return
-    }
-
-    if ($startupAction -eq 'CleanupSnapshots') {
-        $account = Select-Subscription -NextStepDescription 'Next SpotSwitcher reads snapshots in the active subscription. No snapshots are deleted until the exact confirmation prompt.'
-        Invoke-SpotSwitcherSnapshotCleanup -Account $account
-        return
-    }
-
-    $selectedMode = Select-RunMode
-    $account = Select-Subscription
-    $target = Select-TargetVm
-    $inventory = Get-VmInventory -ResourceGroup $target.resourceGroup -Name $target.name
-    $inventory = Wait-ForStableSourcePowerState -Inventory $inventory
-    Show-InventorySummary -Inventory $inventory
-
-    $resolvedDirection = Select-Direction -Inventory $inventory
-    if ($resolvedDirection -eq 'Cancel') {
-        Write-Section 'Stopped'
-        Write-Host 'No Azure resources were changed.'
-        return
-    }
-
-    $decisions = Select-Decisions -Inventory $inventory -ResolvedDirection $resolvedDirection
-    $plan = New-Plan -Account $account -Inventory $inventory -Decisions $decisions
-    $savedPlanPath = Save-Plan -Plan $plan
-    Show-DecisionSummary -Plan $plan
-
-    $commands = @(Get-SwitchCommands -Plan $plan)
-    Show-CommandPreview -Commands $commands
-
-    $shouldExecute = ($selectedMode -eq 'Execute')
-    if ($selectedMode -eq 'Plan') {
-        $rerunCommand = './Switch-AzureVmSpotPriority.ps1 -Mode Execute'
-        $shouldExecute = Resolve-ExecutePreviewedPlan -SavedPlanPath $savedPlanPath -RerunCommand $rerunCommand
-        if (-not $shouldExecute) {
-            Write-Section 'Stopped before changes'
-            Write-Host 'No Azure resources were changed.'
-            Write-Host "Saved conversion plan: $savedPlanPath"
+    try {
+        if ($Help) {
+            Show-Usage
             return
         }
+
+        $notificationStage = 'checking Azure CLI'
+        if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+            Write-Fail 'Azure CLI was not found. Run this in Azure Cloud Shell or install az.'
+        }
+
+        $notificationStage = 'selecting startup action'
+        $startupAction = Select-StartupAction
+        if ($startupAction -eq 'Stop') {
+            Write-Section 'Stopped'
+            Write-Host 'No Azure resources were changed.'
+            return
+        }
+
+        if ($startupAction -eq 'CleanupSnapshots') {
+            $notificationStage = 'cleaning snapshots'
+            $account = Select-Subscription -NextStepDescription 'Next SpotSwitcher reads snapshots in the active subscription. No snapshots are deleted until the exact confirmation prompt.'
+            Invoke-SpotSwitcherSnapshotCleanup -Account $account
+            return
+        }
+
+        $notificationStage = 'selecting run mode'
+        $selectedMode = Select-RunMode
+        $notificationStage = 'selecting subscription'
+        $account = Select-Subscription
+        $notificationStage = 'selecting VM'
+        $target = Select-TargetVm
+        $notificationStage = 'reading VM inventory'
+        $inventory = Get-VmInventory -ResourceGroup $target.resourceGroup -Name $target.name
+        $notificationStage = 'waiting for stable power state'
+        $inventory = Wait-ForStableSourcePowerState -Inventory $inventory
+        Show-InventorySummary -Inventory $inventory
+
+        $notificationStage = 'selecting direction'
+        $resolvedDirection = Select-Direction -Inventory $inventory
+        if ($resolvedDirection -eq 'Cancel') {
+            Write-Section 'Stopped'
+            Write-Host 'No Azure resources were changed.'
+            return
+        }
+
+        $notificationStage = 'selecting conversion decisions'
+        $decisions = Select-Decisions -Inventory $inventory -ResolvedDirection $resolvedDirection
+        $notificationStage = 'building conversion plan'
+        $plan = New-Plan -Account $account -Inventory $inventory -Decisions $decisions
+        $notificationStage = 'saving conversion plan'
+        $savedPlanPath = Save-Plan -Plan $plan
+        Show-DecisionSummary -Plan $plan
+
+        $notificationStage = 'building command preview'
+        $commands = @(Get-SwitchCommands -Plan $plan)
+        Show-CommandPreview -Commands $commands
+
+        $shouldExecute = ($selectedMode -eq 'Execute')
+        if ($selectedMode -eq 'Plan') {
+            $rerunCommand = './Switch-AzureVmSpotPriority.ps1 -Mode Execute'
+            $notificationStage = 'reviewing command preview'
+            $shouldExecute = Resolve-ExecutePreviewedPlan -SavedPlanPath $savedPlanPath -RerunCommand $rerunCommand
+            if (-not $shouldExecute) {
+                Send-SpotSwitcherNotificationSafe -Kind PlanPrepared -Recipients $notificationRecipients -Plan $plan -SavedPlanPath $savedPlanPath -Stage 'plan prepared'
+                Write-Section 'Stopped before changes'
+                Write-Host 'No Azure resources were changed.'
+                Write-Host "Saved conversion plan: $savedPlanPath"
+                return
+            }
+        }
+
+        $targetLabel = if ($resolvedDirection -eq 'ToSpot') { 'SPOT' } else { 'REGULAR' }
+        $notificationStage = 'confirming conversion'
+        Confirm-Exact -Phrase "CONVERT $($plan.source.vm.name) TO $targetLabel"
+        $notificationStage = 'executing conversion commands'
+        Invoke-CommandList -Commands $commands -Execute $true
+
+        Write-Section 'Post-check'
+        $notificationStage = 'post-checking recreated VM'
+        Invoke-AzText -Arguments @(
+            'vm', 'show',
+            '-g', $plan.source.vm.resourceGroup,
+            '-n', $plan.source.vm.name,
+            '-d',
+            '--query', '{powerState:powerState,priority:priority,evictionPolicy:evictionPolicy,vmSize:hardwareProfile.vmSize,availabilitySet:availabilitySet.id,identity:identity,osDisk:storageProfile.osDisk.managedDisk.id,nics:networkProfile.networkInterfaces[].{id:id,primary:primary},tags:tags}',
+            '-o', 'json'
+        ) -Description 'Reading recreated VM summary.'
+
+        Send-SpotSwitcherNotificationSafe -Kind ConversionCompleted -Recipients $notificationRecipients -Plan $plan -SavedPlanPath $savedPlanPath -Stage 'conversion completed'
+        Write-Section 'Done'
+        Write-Host "Conversion completed. Saved conversion plan: $savedPlanPath"
     }
-
-    $targetLabel = if ($resolvedDirection -eq 'ToSpot') { 'SPOT' } else { 'REGULAR' }
-    Confirm-Exact -Phrase "CONVERT $($plan.source.vm.name) TO $targetLabel"
-    Invoke-CommandList -Commands $commands -Execute $true
-
-    Write-Section 'Post-check'
-    Invoke-AzText -Arguments @(
-        'vm', 'show',
-        '-g', $plan.source.vm.resourceGroup,
-        '-n', $plan.source.vm.name,
-        '-d',
-        '--query', '{powerState:powerState,priority:priority,evictionPolicy:evictionPolicy,vmSize:hardwareProfile.vmSize,availabilitySet:availabilitySet.id,identity:identity,osDisk:storageProfile.osDisk.managedDisk.id,nics:networkProfile.networkInterfaces[].{id:id,primary:primary},tags:tags}',
-        '-o', 'json'
-    ) -Description 'Reading recreated VM summary.'
-
-    Write-Section 'Done'
-    Write-Host "Conversion completed. Saved conversion plan: $savedPlanPath"
+    catch {
+        Send-SpotSwitcherNotificationSafe -Kind ConversionFailed -Recipients $notificationRecipients -Plan $plan -SavedPlanPath $savedPlanPath -Stage $notificationStage -ErrorRecord $_
+        throw
+    }
 }
 
-Invoke-Main
+if ($env:SPOTSWITCHER_SKIP_MAIN -ne '1') {
+    Invoke-Main
+}

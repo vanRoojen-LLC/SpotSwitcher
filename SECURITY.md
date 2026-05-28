@@ -11,10 +11,10 @@ iwr https://raw.githubusercontent.com/vanRoojen-LLC/SpotSwitcher/main/Switch-Azu
 
 ## Reporting a vulnerability
 
-Report suspected security issues privately by emailing
-contact@vanroojen.com. Please include the affected script version or commit,
-the Azure CLI and PowerShell versions, reproduction steps, expected impact, and
-any safe sample output that helps confirm the issue.
+Report suspected security issues privately through the SpotSwitcher support
+form at https://spotswitcher.app/support#contact. Please include the affected
+script version or commit, the Azure CLI and PowerShell versions, reproduction
+steps, expected impact, and any safe sample output that helps confirm the issue.
 
 Do not send Azure credentials, private keys, access tokens, passwords, full
 tenant IDs, full subscription IDs, or customer-sensitive VM data. If a report
@@ -24,8 +24,11 @@ still be understood without exposing your environment.
 ## Operational security notes
 
 SpotSwitcher runs under the current Azure identity and calls Azure CLI for the
-resources you choose. It does not send VM inventory, tenant data, plan files, or
-telemetry to vanRoojen LLC.
+resources you choose. By default, it does not send VM inventory, tenant data,
+plan files, or telemetry to vanRoojen LLC. If optional email notifications are
+configured, SpotSwitcher sends only the app-owned notification payload to Toby's
+shared Cloudflare Email Sender Worker and never sends the saved plan contents or
+the CFES HMAC secret.
 
 Saved plan files can contain Azure resource IDs and operational configuration
 metadata. The script redacts VM user data, `osProfile.customData`, and VM
