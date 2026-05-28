@@ -131,7 +131,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Script:SpotSwitcherVersion = '0.8.0'
+$Script:SpotSwitcherVersion = '0.8.1'
 $Script:SpotSwitcherPlanVersion = 8
 $Script:SpotSkuCandidateLimit = 160
 
