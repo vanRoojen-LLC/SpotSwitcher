@@ -45,12 +45,14 @@ architecture, attached data disk count, NIC count, accelerated networking,
 Premium/Ultra disk support, encryption at host, OS disk size, Hyper-V
 generation, and source zone availability. For Spot conversions, the default
 list shows the current SKU first when it is valid for the switch, labeled as
-`Current SKU`, then shows the rest of the CPU/RAM-compatible candidates sorted
-by estimated monthly cost. If the current SKU is not valid for the target
-priority/quota, it is not shown and the list starts with the lowest-cost
-eligible alternatives.
-SKU results are shown five at a time. Use `Custom filter` to search all eligible
-SKU names by another token, for example `E2`, `D4s`, or `Standard_D4ads_v6`.
+`Current SKU`, then shows the closest CPU/RAM-compatible candidates sorted by
+estimated monthly cost. This keeps the slower SKU metadata lookup bounded; pass
+`-TargetSku` to use a specific larger size outside the automatic candidate set.
+If the current SKU is not valid for the target priority/quota, it is not shown
+and the list starts with the lowest-cost eligible alternatives.
+SKU results are shown five at a time. Use `Custom filter` to search the loaded
+eligible SKU names by another token, for example `E2`, `D4s`, or
+`Standard_D4ads_v6`.
 Prices are estimated USD/month retail cost when the public Azure Retail Prices
 API returns a match. The estimate is rounded to the nearest whole dollar, uses
 730 hours/month, and does not include private discounts, reservations, savings

@@ -133,6 +133,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $Script:SpotSwitcherVersion = '0.8.0'
 $Script:SpotSwitcherPlanVersion = 8
+$Script:SpotSkuCandidateLimit = 160
 
 function Show-Usage {
     Write-Host "SpotSwitcher v$Script:SpotSwitcherVersion - Azure VM Regular <-> Spot conversion wizard"
@@ -164,12 +165,12 @@ Interactive SKU selection:
     data disks, NIC count, accelerated networking, Premium/Ultra storage,
     encryption at host, OS disk size, Hyper-V generation, and source zone.
   - For Spot conversions, candidate SKUs must meet or exceed the source VM
-    vCPU/RAM shape. If the current SKU is valid for the switch, it is listed
-    first as "Current SKU"; alternatives come from the same CPU/RAM-compatible
-    candidate set and are sorted by lowest estimated whole USD/month retail
-    cost.
+    vCPU/RAM shape. The automatic search narrows metadata lookup to the closest
+    CPU/RAM matches before pricing and quota checks. If the current SKU is valid
+    for the switch, it is listed first as "Current SKU"; alternatives are sorted
+    by lowest estimated whole USD/month retail cost.
   - The picker shows five SKU choices at a time. Use Custom filter to search
-    all eligible SKUs by another token such as E2, D4s, or Standard_D4ads_v6.
+    loaded eligible SKUs by another token such as E2, D4s, or Standard_D4ads_v6.
   - For Regular conversions, candidate SKUs use the exact source VM vCPU/RAM
     shape unless -TargetCores or -TargetMemoryGB override it.
 
@@ -3046,7 +3047,7 @@ function Read-TargetHardwareShape {
         Write-Info "Using source VM shape: $cores vCPU / $memoryText GiB RAM."
     }
     if ($ResolvedDirection -eq 'ToSpot') {
-        Write-Info 'Spot conversion uses this as the minimum required shape, then sorts viable options by lowest estimated monthly cost.'
+        Write-Info 'Spot conversion uses this as the minimum required shape, narrows automatic SKU lookup to the closest CPU/RAM matches, then sorts viable options by lowest estimated monthly cost.'
     }
     else {
         Write-WarningLine 'Only VM sizes with this exact vCPU and RAM shape will be considered before quota/SKU checks.'
@@ -3059,7 +3060,7 @@ function Read-TargetHardwareShape {
     }
 }
 
-function Get-CandidateVmSizeNames {
+function Get-CandidateVmSizeRecords {
     param(
         [object[]]$Sizes,
         [int]$Cores,
@@ -3068,21 +3069,55 @@ function Get-CandidateVmSizeNames {
     )
 
     return @($Sizes |
-        Where-Object {
+        ForEach-Object {
             $candidateCores = ConvertTo-IntOrNull -Value $_.numberOfCores
             $candidateMemoryMB = ConvertTo-IntOrNull -Value $_.memoryInMB
-            if ($null -eq $candidateCores -or $null -eq $candidateMemoryMB) {
-                $false
-            }
-            elseif ($Minimum) {
-                $candidateCores -ge $Cores -and $candidateMemoryMB -ge $MemoryMB
-            }
-            else {
-                $candidateCores -eq $Cores -and $candidateMemoryMB -eq $MemoryMB
+            if ($null -ne $candidateCores -and $null -ne $candidateMemoryMB) {
+                $matches = if ($Minimum) {
+                    ($candidateCores -ge $Cores -and $candidateMemoryMB -ge $MemoryMB)
+                }
+                else {
+                    ($candidateCores -eq $Cores -and $candidateMemoryMB -eq $MemoryMB)
+                }
+
+                if ($matches) {
+                    $coreOverage = if ($Cores -gt 0) { ($candidateCores - $Cores) / [double]$Cores } else { 0.0 }
+                    $memoryOverage = if ($MemoryMB -gt 0) { ($candidateMemoryMB - $MemoryMB) / [double]$MemoryMB } else { 0.0 }
+                    if (-not $Minimum) {
+                        $coreOverage = 0.0
+                        $memoryOverage = 0.0
+                    }
+
+                    [pscustomobject]@{
+                        name             = $_.name
+                        numberOfCores    = $candidateCores
+                        memoryInMB       = $candidateMemoryMB
+                        coreOverage      = $coreOverage
+                        memoryOverage    = $memoryOverage
+                        maxOverage       = [math]::Max($coreOverage, $memoryOverage)
+                        totalOverage     = $coreOverage + $memoryOverage
+                    }
+                }
             }
         } |
-        Select-Object -ExpandProperty name -Unique |
-        Sort-Object)
+        Sort-Object maxOverage, totalOverage, numberOfCores, memoryInMB, name)
+}
+
+function Get-CandidateVmSizeNames {
+    param(
+        [object[]]$Sizes,
+        [int]$Cores,
+        [int]$MemoryMB,
+        [switch]$Minimum,
+        [int]$Limit = 0
+    )
+
+    $records = @(Get-CandidateVmSizeRecords -Sizes $Sizes -Cores $Cores -MemoryMB $MemoryMB -Minimum:$Minimum)
+    if ($Limit -gt 0 -and $records.Count -gt $Limit) {
+        $records = @($records | Select-Object -First $Limit)
+    }
+
+    return @($records | Select-Object -ExpandProperty name -Unique)
 }
 
 function Get-SkuCatalog {
@@ -3896,14 +3931,20 @@ function Select-TargetSku {
 
     $targetShape = Read-TargetHardwareShape -CurrentSize $currentSize -SourceSize $sourceSize -ResolvedDirection $ResolvedDirection
     $useMinimumShape = ($ResolvedDirection -eq 'ToSpot')
-    $candidateSizeNames = @(Get-CandidateVmSizeNames -Sizes $regionalSizes -Cores $targetShape.Cores -MemoryMB $targetShape.MemoryMB -Minimum:$useMinimumShape)
+    $allCandidateSizeNames = @(Get-CandidateVmSizeNames -Sizes $regionalSizes -Cores $targetShape.Cores -MemoryMB $targetShape.MemoryMB -Minimum:$useMinimumShape)
+    $candidateLimit = if ($useMinimumShape) { $Script:SpotSkuCandidateLimit } else { 0 }
+    $candidateSizeNames = @(Get-CandidateVmSizeNames -Sizes $regionalSizes -Cores $targetShape.Cores -MemoryMB $targetShape.MemoryMB -Minimum:$useMinimumShape -Limit $candidateLimit)
+    $usedNarrowedCandidateSet = ($useMinimumShape -and $candidateSizeNames.Count -lt $allCandidateSizeNames.Count)
     if ($candidateSizeNames.Count -eq 0) {
         $matchText = if ($useMinimumShape) { 'met or exceeded' } else { 'exactly matched' }
         Write-Fail "No VM sizes in $($Vm.location) $matchText $($targetShape.Cores) vCPU / $(Format-MemoryGB -MemoryGB $targetShape.MemoryGB) GiB RAM. Pass -TargetSku to use a specific SKU explicitly."
     }
 
     if ($useMinimumShape) {
-        Write-Info "Found $($candidateSizeNames.Count) VM size name(s) that meet or exceed the target shape before SKU metadata lookup."
+        Write-Info "Found $($allCandidateSizeNames.Count) VM size name(s) that meet or exceed the target shape before SKU metadata lookup."
+        if ($usedNarrowedCandidateSet) {
+            Write-Info "Narrowing automatic SKU metadata lookup to the $($candidateSizeNames.Count) closest CPU/RAM shape match(es). Pass -TargetSku to use a specific larger SKU."
+        }
     }
     else {
         Write-Info "Found $($candidateSizeNames.Count) VM size name(s) with the exact target shape before SKU metadata lookup."
@@ -3946,6 +3987,19 @@ function Select-TargetSku {
     $targetSkus = @($allSkus | Where-Object { $candidateNameLookup.ContainsKey($_.name) })
     $targetSkus = @(Get-SourceCompatibleSkus -Skus $targetSkus -Requirements $sourceRequirements)
     $eligibleSkus = @(Get-QuotaEligibleSkus -Skus $targetSkus -Usages $quotaUsages -ResolvedDirection $ResolvedDirection -SourceSku $sourceSku -SourceVm $Vm)
+    if ($eligibleSkus.Count -eq 0 -and $usedNarrowedCandidateSet) {
+        Write-WarningLine 'No eligible SKUs were found in the narrowed automatic candidate set. Expanding SKU metadata lookup to all minimum-shape matches before failing.'
+        $candidateSizeNames = $allCandidateSizeNames
+        $catalogSizeNames = @($candidateSizeNames + @($currentSize) | Sort-Object -Unique)
+        $allSkus = @(Get-SkuCatalog -Location $Vm.location -SizeNames $catalogSizeNames)
+        $candidateNameLookup = @{}
+        foreach ($candidateName in $candidateSizeNames) {
+            $candidateNameLookup[$candidateName] = $true
+        }
+        $targetSkus = @($allSkus | Where-Object { $candidateNameLookup.ContainsKey($_.name) })
+        $targetSkus = @(Get-SourceCompatibleSkus -Skus $targetSkus -Requirements $sourceRequirements)
+        $eligibleSkus = @(Get-QuotaEligibleSkus -Skus $targetSkus -Usages $quotaUsages -ResolvedDirection $ResolvedDirection -SourceSku $sourceSku -SourceVm $Vm)
+    }
     if ($eligibleSkus.Count -eq 0) {
         Write-Fail 'No unrestricted quota-eligible SKUs were found. Pass -TargetSku to use a specific SKU explicitly.'
     }
@@ -3968,13 +4022,13 @@ function Select-TargetSku {
         $alternatives = @($costSortedSkus | Where-Object { $_.name -ne $currentSize })
         $filterSkus = @(@($currentChoice) + @($alternatives))
 
-        Write-Info 'Current SKU is valid for the target. Showing it first, then all CPU/RAM-compatible alternatives sorted by estimated monthly cost.'
-        Write-Info 'Use Custom filter to search all eligible SKUs by another token such as E2 or D4s.'
+        Write-Info 'Current SKU is valid for the target. Showing it first, then automatic CPU/RAM-compatible alternatives sorted by estimated monthly cost.'
+        Write-Info 'Use Custom filter to search the loaded eligible SKU candidates by another token such as E2 or D4s.'
         $displaySkus = @(@($currentChoice) + @($alternatives))
     }
     else {
         Write-Info "Current SKU '$currentSize' is not eligible for the target priority/quota, so it is not listed."
-        Write-Info 'Showing the lowest-cost eligible alternatives from the CPU/RAM-compatible candidate set. Use Custom filter to search all eligible SKUs by another token such as E2 or D4s.'
+        Write-Info 'Showing the lowest-cost eligible alternatives from the automatic CPU/RAM-compatible candidate set. Use Custom filter to search the loaded eligible SKU candidates by another token such as E2 or D4s.'
         $displaySkus = $costSortedSkus
     }
 

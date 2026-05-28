@@ -66,10 +66,11 @@ VM lookup can search by name prefix; matching VM names are returned as a
 10-at-a-time pick list.
 SKU browsing shows five choices at a time. When the current SKU is valid for the
 target priority/quota, it is listed first as Current SKU, followed by the rest
-of the CPU/RAM-compatible candidates sorted by estimated monthly cost. Custom
-filter searches all eligible SKU names by another token. Pricing is rounded to
-the nearest whole dollar and uses a 730-hour/month public retail estimate, not
-invoice-specific billing.
+of the closest CPU/RAM-compatible candidates sorted by estimated monthly cost.
+Custom filter searches loaded eligible SKU names by another token. Use
+-TargetSku for a specific larger size outside the automatic candidate set.
+Pricing is rounded to the nearest whole dollar and uses a 730-hour/month public
+retail estimate, not invoice-specific billing.
 For transitional source states, conversion warns and waits until the VM reaches
 running, stopped, or deallocated before building the conversion plan.
 Snapshot cleanup lists tagged SpotSwitcher snapshots before asking for exact
