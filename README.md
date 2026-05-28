@@ -34,7 +34,8 @@ SpotSwitcher warns and waits until the VM reaches a stable state before planning
 the conversion.
 After subscription selection, choose whether to browse VMs in the subscription
 or enter the resource group and VM name manually. Manual entry avoids a
-subscription-wide VM list call.
+subscription-wide VM list call. Prefix search asks for the start of the VM name
+and returns all matching VMs in a 10-at-a-time pick list.
 When choosing a target size, Spot conversions treat the source VM's vCPU/RAM
 shape as the minimum required capacity unless `-TargetCores` or
 `-TargetMemoryGB` override it. Regular conversions use the exact source vCPU/RAM
@@ -139,16 +140,22 @@ host or capacity reservation placement, license type, Trusted Launch settings,
 encryption-at-host, disk controller type, Ultra SSD and hibernation capability,
 boot diagnostics, VM-scoped Azure Monitor diagnostic settings, maintenance
 configuration assignments, VM Applications, direct VM management locks,
-user-assigned identities, and the stable source power state where Azure CLI can
-safely reapply them.
+user-assigned identities, visible RBAC assignments from the current subscription
+and parent scopes for a system-assigned identity, visible legacy Key Vault
+access policies for a system-assigned identity, and the stable source power
+state where Azure CLI can safely reapply them.
 
 Known Azure recreation gaps to review before execution:
 
 - VM extensions are listed for review, but protected settings cannot be read
   back from Azure, so extensions are not automatically reinstalled.
 - A system-assigned managed identity can be re-enabled, but Azure creates a new
-  principal ID. Any RBAC assignments, Key Vault access policies, or app
-  allow-lists tied to the old principal may need repair.
+  principal ID. SpotSwitcher snapshots and replays visible RBAC assignments from
+  the current subscription and parent scopes, plus visible legacy Key Vault
+  access policies. App allow-lists, Entra app-role assignments, group
+  memberships, directory roles/PIM eligibility, and role assignments outside the
+  visible subscription/parent-scope query or invisible to the current identity
+  still need review.
 - Availability-set membership must be dropped when converting to Spot because
   Azure Spot VMs do not support availability sets.
 - Dedicated host, host group, and capacity reservation placement must be
@@ -172,9 +179,9 @@ unattended mode, pass `-AcceptReservationSavingsImpact Yes` to continue after
 saving the matching reservation details in the plan.
 
 Review-only items such as extensions with protected settings, inherited locks,
-Azure Backup protection, VM-scoped Azure Policy artifacts, osProfile
-secrets/certificates, and user data are shown with the current settings
-SpotSwitcher can safely print. In unattended mode, pass
+Azure Backup protection, VM-scoped Azure Policy artifacts, external identity
+references, osProfile secrets/certificates, and user data are shown with the
+current settings SpotSwitcher can safely print. In unattended mode, pass
 `-AcceptReviewOnlyItems Yes` to continue after saving those notes in the plan.
 The saved plan includes a `source.sensitiveRedactions` list when sensitive
 bootstrap fields were present and intentionally omitted.

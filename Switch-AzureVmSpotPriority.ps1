@@ -19,8 +19,11 @@ the existing managed OS disk, managed data disks, NICs, tags, VM size choice,
 Trusted Launch settings, marketplace plan, compatible dedicated host/capacity
 reservation placement, license type, boot diagnostics, direct VM locks,
 diagnostic settings, maintenance assignments, VM applications, and identities
-where Azure CLI can safely reapply them. It also returns stable source power
-states: running, stopped, or deallocated.
+where Azure CLI can safely reapply them. For system-assigned identities, it
+also snapshots visible RBAC assignments from the current subscription and parent
+scopes plus visible legacy Key Vault access policies so they can be replayed to
+the new principal ID. It also returns stable source power states: running,
+stopped, or deallocated.
 
 The default interactive flow performs discovery, writes a plan file, previews
 the commands, and then asks whether to run that just-built conversion. Nothing
@@ -128,10 +131,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$Script:SpotSwitcherVersion = '0.8.0'
+$Script:SpotSwitcherPlanVersion = 8
 
 function Show-Usage {
+    Write-Host "SpotSwitcher v$Script:SpotSwitcherVersion - Azure VM Regular <-> Spot conversion wizard"
     Write-Host @'
-SpotSwitcher - Azure VM Regular <-> Spot conversion wizard
 
 Interactive:
   ./Switch-AzureVmSpotPriority.ps1
@@ -193,11 +198,14 @@ Safety defaults:
     for regular VM recreation, but must be intentionally dropped for Spot
     conversion because Spot uses spare capacity rather than reserved placement.
   - Review-only items such as extensions with protected settings, inherited
-    locks, backup state, VM-scoped policy artifacts, osProfile secrets, and user
-    data are listed with current settings before you choose whether to continue.
+    locks, backup state, VM-scoped policy artifacts, external identity
+    references, osProfile secrets, and user data are listed with current
+    settings before you choose whether to continue.
   - If an active Reserved VM Instance may be covering the source VM, SpotSwitcher
     warns and defaults to stopping because converting to Spot can strand or
     reassign that billing benefit.
+  - Source VM lookup can search by name prefix and returns all matching VMs in a
+    10-at-a-time pick list.
   - Running the conversion requires exact typed confirmation unless -Force is supplied.
 '@
 }
@@ -451,8 +459,34 @@ function New-AzCommand {
 
     [pscustomobject]@{
         Description = $Description
+        Kind        = 'Az'
         Arguments   = @($Arguments)
     }
+}
+
+function New-ActionCommand {
+    param(
+        [string]$Description,
+        [string[]]$PreviewLines,
+        [scriptblock]$ScriptBlock
+    )
+
+    [pscustomobject]@{
+        Description = $Description
+        Kind        = 'Action'
+        PreviewLines = @($PreviewLines)
+        ScriptBlock = $ScriptBlock.GetNewClosure()
+    }
+}
+
+function Get-CommandPreviewLines {
+    param($Command)
+
+    if ($Command.PSObject.Properties['Kind'] -and $Command.Kind -eq 'Action') {
+        return @($Command.PreviewLines)
+    }
+
+    return @((Format-AzCommand $Command.Arguments))
 }
 
 function New-AzureResourceName {
@@ -500,9 +534,16 @@ function Invoke-CommandList {
     foreach ($command in $Commands) {
         Write-Host ''
         Write-Host $command.Description -ForegroundColor Green
-        Write-Host (Format-AzCommand $command.Arguments)
+        foreach ($line in @(Get-CommandPreviewLines -Command $command)) {
+            Write-Host $line
+        }
 
         if ($Execute) {
+            if ($command.PSObject.Properties['Kind'] -and $command.Kind -eq 'Action') {
+                & $command.ScriptBlock
+                continue
+            }
+
             $output = & az @($command.Arguments) 2>&1
             $exitCode = $LASTEXITCODE
             $text = ($output | Out-String).Trim()
@@ -1115,6 +1156,284 @@ function Get-ResourceLockListArguments {
     )
 }
 
+function Test-SystemAssignedIdentity {
+    param($Vm)
+
+    return (
+        $Vm.identity -and
+        [string]$Vm.identity.type -like '*SystemAssigned*' -and
+        -not [string]::IsNullOrWhiteSpace([string]$Vm.identity.principalId)
+    )
+}
+
+function Get-SystemAssignedIdentityRoleAssignments {
+    param([string]$PrincipalId)
+
+    if ([string]::IsNullOrWhiteSpace($PrincipalId)) {
+        return @()
+    }
+
+    return @(Invoke-AzJsonOptional `
+            -Arguments @(
+                'role', 'assignment', 'list',
+                '--assignee-object-id', $PrincipalId,
+                '--all',
+                '--include-inherited',
+                '--fill-principal-name', 'false',
+                '-o', 'json'
+            ) `
+            -Description 'Reading visible Azure RBAC assignments for the system-assigned managed identity.' `
+            -WarningLabel 'System-assigned identity RBAC inventory' `
+            -TimeoutSeconds 120)
+}
+
+function Get-KeyVaultAccessPoliciesFromVault {
+    param($Vault)
+
+    if ($Vault.properties -and $Vault.properties.accessPolicies) {
+        return @($Vault.properties.accessPolicies)
+    }
+
+    if ($Vault.accessPolicies) {
+        return @($Vault.accessPolicies)
+    }
+
+    return @()
+}
+
+function Get-KeyVaultRbacEnabledValue {
+    param($Vault)
+
+    if ($Vault.properties -and $null -ne $Vault.properties.enableRbacAuthorization) {
+        return $Vault.properties.enableRbacAuthorization
+    }
+
+    if ($null -ne $Vault.enableRbacAuthorization) {
+        return $Vault.enableRbacAuthorization
+    }
+
+    return $null
+}
+
+function Get-SystemAssignedIdentityKeyVaultAccessPolicies {
+    param([string]$PrincipalId)
+
+    if ([string]::IsNullOrWhiteSpace($PrincipalId)) {
+        return @()
+    }
+
+    $vaults = @(Invoke-AzJsonOptional `
+            -Arguments @('keyvault', 'list', '-o', 'json') `
+            -Description 'Reading visible Key Vault access policies for the system-assigned managed identity.' `
+            -WarningLabel 'System-assigned identity Key Vault policy inventory' `
+            -TimeoutSeconds 120)
+
+    $matches = @()
+    foreach ($vault in $vaults) {
+        foreach ($policy in @(Get-KeyVaultAccessPoliciesFromVault -Vault $vault)) {
+            if (-not [string]::Equals([string]$policy.objectId, $PrincipalId, [System.StringComparison]::OrdinalIgnoreCase)) {
+                continue
+            }
+
+            $matches += [pscustomobject]@{
+                vaultId                 = $vault.id
+                vaultName               = $vault.name
+                resourceGroup           = $vault.resourceGroup
+                location                = $vault.location
+                enableRbacAuthorization = Get-KeyVaultRbacEnabledValue -Vault $vault
+                tenantId                = $policy.tenantId
+                objectId                = $policy.objectId
+                applicationId           = $policy.applicationId
+                permissions             = $policy.permissions
+            }
+        }
+    }
+
+    return $matches
+}
+
+function Get-RoleAssignmentRoleValue {
+    param($Assignment)
+
+    if ($Assignment.roleDefinitionId) {
+        return [string]$Assignment.roleDefinitionId
+    }
+
+    if ($Assignment.roleDefinitionName) {
+        return [string]$Assignment.roleDefinitionName
+    }
+
+    return $null
+}
+
+function Get-RoleAssignmentLabel {
+    param($Assignment)
+
+    $role = if ($Assignment.roleDefinitionName) { [string]$Assignment.roleDefinitionName } else { Get-RoleAssignmentRoleValue -Assignment $Assignment }
+    if ([string]::IsNullOrWhiteSpace($role)) {
+        $role = '<unknown role>'
+    }
+
+    $scope = if ($Assignment.scope) { [string]$Assignment.scope } else { '<unknown scope>' }
+    return "$role at $scope"
+}
+
+function Get-RoleAssignmentRestoreSkipReason {
+    param($Assignment)
+
+    if ([string]::IsNullOrWhiteSpace((Get-RoleAssignmentRoleValue -Assignment $Assignment))) {
+        return 'missing role definition'
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$Assignment.scope)) {
+        return 'missing scope'
+    }
+
+    if ($Assignment.delegatedManagedIdentityResourceId) {
+        return 'delegated managed identity role assignments are not exposed by az role assignment create'
+    }
+
+    if ($Assignment.canDelegate -eq $true -or [string]$Assignment.canDelegate -eq 'True') {
+        return 'delegated role assignments are not recreated automatically'
+    }
+
+    return $null
+}
+
+function Get-RestorableRoleAssignments {
+    param([object[]]$Assignments)
+
+    return @($Assignments | Where-Object { $null -eq (Get-RoleAssignmentRestoreSkipReason -Assignment $_) })
+}
+
+function Get-SkippedRoleAssignments {
+    param([object[]]$Assignments)
+
+    return @($Assignments | Where-Object { $null -ne (Get-RoleAssignmentRestoreSkipReason -Assignment $_) })
+}
+
+function Get-RoleAssignmentCreateArguments {
+    param(
+        $Assignment,
+        [string]$PrincipalId
+    )
+
+    $role = Get-RoleAssignmentRoleValue -Assignment $Assignment
+    if ([string]::IsNullOrWhiteSpace($role) -or [string]::IsNullOrWhiteSpace([string]$Assignment.scope)) {
+        return @()
+    }
+
+    $args = @(
+        'role', 'assignment', 'create',
+        '--assignee-object-id', $PrincipalId,
+        '--assignee-principal-type', 'ServicePrincipal',
+        '--role', $role,
+        '--scope', ([string]$Assignment.scope)
+    )
+
+    if ($Assignment.condition) {
+        $args += @('--condition', ([string]$Assignment.condition))
+    }
+
+    if ($Assignment.conditionVersion) {
+        $args += @('--condition-version', ([string]$Assignment.conditionVersion))
+    }
+
+    if ($Assignment.description) {
+        $args += @('--description', ([string]$Assignment.description))
+    }
+
+    return $args
+}
+
+function Get-AccessPolicyPermissionValues {
+    param(
+        $Permissions,
+        [string]$Name
+    )
+
+    if ($null -eq $Permissions) {
+        return @()
+    }
+
+    if ($Permissions -is [System.Collections.IDictionary] -and $Permissions.Contains($Name)) {
+        return @($Permissions[$Name])
+    }
+
+    if ($Permissions.PSObject.Properties[$Name]) {
+        return @($Permissions.$Name)
+    }
+
+    return @()
+}
+
+function Get-KeyVaultSetPolicyArguments {
+    param(
+        $Policy,
+        [string]$PrincipalId
+    )
+
+    if ([string]::IsNullOrWhiteSpace([string]$Policy.vaultName)) {
+        return @()
+    }
+
+    $args = @(
+        'keyvault', 'set-policy',
+        '-n', ([string]$Policy.vaultName)
+    )
+
+    if ($Policy.resourceGroup) {
+        $args += @('-g', ([string]$Policy.resourceGroup))
+    }
+
+    $args += @('--object-id', $PrincipalId)
+
+    if ($Policy.applicationId) {
+        $args += @('--application-id', ([string]$Policy.applicationId))
+    }
+
+    $permissionCount = 0
+    $permissionSets = @(
+        [pscustomobject]@{ Name = 'keys'; Argument = '--key-permissions' },
+        [pscustomobject]@{ Name = 'secrets'; Argument = '--secret-permissions' },
+        [pscustomobject]@{ Name = 'certificates'; Argument = '--certificate-permissions' },
+        [pscustomobject]@{ Name = 'storage'; Argument = '--storage-permissions' }
+    )
+
+    foreach ($set in $permissionSets) {
+        $values = @(Get-AccessPolicyPermissionValues -Permissions $Policy.permissions -Name $set.Name | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+        if ($values.Count -gt 0) {
+            $args += $set.Argument
+            $args += @($values | ForEach-Object { [string]$_ })
+            $permissionCount += $values.Count
+        }
+    }
+
+    if ($permissionCount -eq 0) {
+        return @()
+    }
+
+    return $args
+}
+
+function Get-RecreatedSystemAssignedPrincipalId {
+    param($Vm)
+
+    $identity = Invoke-AzJson -Arguments @(
+        'vm', 'show',
+        '-g', $Vm.resourceGroup,
+        '-n', $Vm.name,
+        '--query', 'identity',
+        '-o', 'json'
+    ) -Description 'Reading recreated system-assigned managed identity principal ID.'
+
+    if (-not $identity -or [string]::IsNullOrWhiteSpace([string]$identity.principalId)) {
+        Write-Fail 'The recreated VM does not expose a system-assigned managed identity principal ID.'
+    }
+
+    return [string]$identity.principalId
+}
+
 function Get-PlanSourceCollection {
     param(
         $Plan,
@@ -1170,14 +1489,26 @@ function Get-ReviewOnlyItems {
     }
 
     if ($vm.identity -and [string]$vm.identity.type -like '*SystemAssigned*') {
+        $roleAssignments = @($Inventory.systemAssignedIdentityRoleAssignments)
+        $restorableRoleAssignments = @(Get-RestorableRoleAssignments -Assignments $roleAssignments)
+        $skippedRoleAssignments = @(Get-SkippedRoleAssignments -Assignments $roleAssignments)
+        $keyVaultPolicies = @($Inventory.systemAssignedIdentityKeyVaultAccessPolicies)
+        $details = @(
+            "type=$($vm.identity.type)",
+            "principalId=$($vm.identity.principalId)",
+            "tenantId=$($vm.identity.tenantId)",
+            "azureRbacAssignments=$($roleAssignments.Count); automaticReplay=$($restorableRoleAssignments.Count); manualReview=$($skippedRoleAssignments.Count)",
+            "legacyKeyVaultAccessPolicies=$($keyVaultPolicies.Count); automaticReplay=$($keyVaultPolicies.Count)"
+        )
+        foreach ($assignment in $skippedRoleAssignments) {
+            $details += "manualRbacReview=$(Get-RoleAssignmentLabel -Assignment $assignment); reason=$(Get-RoleAssignmentRestoreSkipReason -Assignment $assignment)"
+        }
+        $details += 'manualReview=app allow-lists, Entra app-role assignments, group memberships, directory roles/PIM eligibility, and assignments outside the visible subscription/parent-scope query or invisible to the current identity'
+
         $items += New-ReviewOnlyItem `
             -Category 'System-assigned managed identity' `
-            -Impact 'The identity can be re-enabled, but Azure creates a new principal ID. Re-check RBAC, Key Vault access policies, and app allow-lists after conversion.' `
-            -Details @(
-                "type=$($vm.identity.type)",
-                "principalId=$($vm.identity.principalId)",
-                "tenantId=$($vm.identity.tenantId)"
-            )
+            -Impact 'The identity can be re-enabled, but Azure creates a new principal ID. SpotSwitcher will replay visible RBAC assignments and visible legacy Key Vault policies; review external identity references after conversion.' `
+            -Details $details
     }
 
     $inheritedLocks = @($Inventory.inheritedLocks)
@@ -1601,7 +1932,7 @@ function Show-ReviewOnlyItems {
     }
 
     Write-Section 'Manual follow-up warnings'
-    Write-WarningLine 'These source VM settings cannot be safely round-tripped by Azure CLI. SpotSwitcher will save these notes in the plan for post-conversion review.'
+    Write-WarningLine 'Some source VM settings or external references still need post-conversion review. SpotSwitcher will save these notes in the plan.'
     foreach ($item in @($Items)) {
         Write-Host ''
         Write-Host ("  - {0}" -f $item.category) -ForegroundColor White
@@ -3071,7 +3402,10 @@ function Select-PagedSku {
 }
 
 function Select-PagedVm {
-    param([object[]]$Vms)
+    param(
+        [object[]]$Vms,
+        [string]$Title = 'Source VM'
+    )
 
     $pageSize = 10
     $offset = 0
@@ -3104,13 +3438,32 @@ function Select-PagedVm {
             Value       = '__manual__'
         }
 
-        $selected = Read-MenuChoice -Title 'Source VM' -Options $options -Default 1
+        $selected = Read-MenuChoice -Title $Title -Options $options -Default 1
         if ($selected -eq '__more__') {
             $offset += $pageSize
             continue
         }
 
         return $selected
+    }
+}
+
+function Select-PrefixSearchedVm {
+    param([object[]]$Vms)
+
+    $sortedVms = @($Vms | Sort-Object resourceGroup, name)
+
+    while ($true) {
+        $prefix = Read-RequiredText -Prompt 'VM name starts with' -ExistingValue $null
+        $prefixPattern = [System.Management.Automation.WildcardPattern]::Escape($prefix) + '*'
+        $matches = @($sortedVms | Where-Object { $_.name -like $prefixPattern })
+        if ($matches.Count -eq 0) {
+            Write-WarningLine "No VM names start with '$prefix'. Try a shorter prefix."
+            continue
+        }
+
+        Write-Info ("Found {0} VM(s) whose name starts with '{1}'." -f $matches.Count, $prefix)
+        return (Select-PagedVm -Vms $matches -Title "Source VM matches prefix '$prefix'")
     }
 }
 
@@ -3124,7 +3477,7 @@ function Select-StartupAction {
     }
 
     return Read-MenuChoice `
-        -Title 'What do you want to do?' `
+        -Title "SpotSwitcher v$Script:SpotSwitcherVersion - What do you want to do?" `
         -Default 1 `
         -Options @(
             [pscustomobject]@{
@@ -3229,8 +3582,14 @@ function Select-TargetVm {
         -Default 1 `
         -Options @(
             [pscustomobject]@{
-                Label           = 'Browse VMs in current subscription'
-                Description     = 'Lists VM resource records first; detailed power, NIC, and disk inventory is read after you choose one.'
+                Label           = 'Search VMs by name prefix'
+                Description     = 'Lists VM resource records, asks for the start of the VM name, then shows matching VMs 10 at a time.'
+                WaitDescription = 'The next Azure CLI call lists VM resources. Then SpotSwitcher will ask for a VM name prefix.'
+                Value           = 'prefix'
+            },
+            [pscustomobject]@{
+                Label           = 'Browse all VMs in current subscription'
+                Description     = 'Lists VM resource records and shows them 10 at a time.'
                 WaitDescription = 'The next Azure CLI call lists VM resources. It is usually quick, but large subscriptions can take a minute or more.'
                 Value           = 'browse'
             },
@@ -3260,7 +3619,13 @@ function Select-TargetVm {
         Write-Fail 'No VMs were found in the active subscription.'
     }
 
-    $selected = Select-PagedVm -Vms $vms
+    $selected = if ($lookupMode -eq 'prefix') {
+        Select-PrefixSearchedVm -Vms $vms
+    }
+    else {
+        Select-PagedVm -Vms $vms
+    }
+
     if ($selected -eq '__manual__') {
         return [pscustomobject]@{
             resourceGroup = Read-RequiredText -Prompt 'Resource group name' -ExistingValue $ResourceGroupName
@@ -3315,6 +3680,12 @@ function Get-VmInventory {
             -Arguments @('policy', 'exemption', 'list', '--scope', $vm.id, '-o', 'json') `
             -Description 'Reading VM-scoped Azure Policy exemptions.' `
             -WarningLabel 'Azure Policy exemption inventory')
+    $systemAssignedIdentityRoleAssignments = @()
+    $systemAssignedIdentityKeyVaultAccessPolicies = @()
+    if (Test-SystemAssignedIdentity -Vm $vm) {
+        $systemAssignedIdentityRoleAssignments = @(Get-SystemAssignedIdentityRoleAssignments -PrincipalId $vm.identity.principalId)
+        $systemAssignedIdentityKeyVaultAccessPolicies = @(Get-SystemAssignedIdentityKeyVaultAccessPolicies -PrincipalId $vm.identity.principalId)
+    }
 
     $nics = @()
     foreach ($nicRef in @($vm.networkProfile.networkInterfaces)) {
@@ -3351,6 +3722,8 @@ function Get-VmInventory {
         backupProtection = $backupProtection
         policyAssignments = $policyAssignments
         policyExemptions = $policyExemptions
+        systemAssignedIdentityRoleAssignments = $systemAssignedIdentityRoleAssignments
+        systemAssignedIdentityKeyVaultAccessPolicies = $systemAssignedIdentityKeyVaultAccessPolicies
         nics         = $nics
         osDisk       = $osDisk
         dataDisks    = $dataDisks
@@ -3447,7 +3820,7 @@ function Show-InventorySummary {
     }
 
     if ($vm.identity -and [string]$vm.identity.type -like '*SystemAssigned*') {
-        Write-WarningLine 'System-assigned managed identity can be re-enabled, but Azure creates a new principal ID after the VM wrapper is recreated.'
+        Write-WarningLine 'System-assigned managed identity can be re-enabled, but Azure creates a new principal ID after the VM wrapper is recreated. SpotSwitcher will replay captured visible RBAC and legacy Key Vault policies, but external identity references still need review.'
     }
 
     if ($vm.osProfile -and @($vm.osProfile.secrets).Count -gt 0) {
@@ -4013,7 +4386,8 @@ function New-Plan {
     $sensitiveRedactions = @($planSafeVm.Redactions + $planSafeExtensions.Redactions)
 
     [ordered]@{
-        planVersion = 7
+        scriptVersion = $Script:SpotSwitcherVersion
+        planVersion = $Script:SpotSwitcherPlanVersion
         generatedAt = (Get-Date).ToString('o')
         planId = "$($vm.name)-$($Decisions.direction)-$stamp"
         subscription = @{
@@ -4034,6 +4408,8 @@ function New-Plan {
             backupProtection = $Inventory.backupProtection
             policyAssignments = $Inventory.policyAssignments
             policyExemptions = $Inventory.policyExemptions
+            systemAssignedIdentityRoleAssignments = $Inventory.systemAssignedIdentityRoleAssignments
+            systemAssignedIdentityKeyVaultAccessPolicies = $Inventory.systemAssignedIdentityKeyVaultAccessPolicies
             reviewOnlyItems = $Decisions.reviewOnlyItems
             reservationSavingsImpact = $Decisions.reservationSavingsImpact
             nics = $Inventory.nics
@@ -4520,6 +4896,83 @@ function Get-ReviewOnlyCommands {
     return $commands
 }
 
+function Get-SystemAssignedIdentityAuthorizationRestoreCommands {
+    param($Plan)
+
+    $vm = $Plan.source.vm
+    if (-not ($vm.identity -and [string]$vm.identity.type -like '*SystemAssigned*')) {
+        return @()
+    }
+
+    $roleAssignments = @(Get-PlanSourceCollection -Plan $Plan -Name 'systemAssignedIdentityRoleAssignments')
+    $restorableRoleAssignments = @(Get-RestorableRoleAssignments -Assignments $roleAssignments)
+    $skippedRoleAssignments = @(Get-SkippedRoleAssignments -Assignments $roleAssignments)
+    $keyVaultPolicies = @(Get-PlanSourceCollection -Plan $Plan -Name 'systemAssignedIdentityKeyVaultAccessPolicies')
+
+    if ($restorableRoleAssignments.Count -eq 0 -and $skippedRoleAssignments.Count -eq 0 -and $keyVaultPolicies.Count -eq 0) {
+        return @()
+    }
+
+    $placeholderPrincipalId = '<new-system-assigned-principal-id>'
+    $previewLines = @(
+        '# Dynamic step: read the recreated VM identity principalId, then replay captured identity bindings.'
+    )
+
+    foreach ($assignment in $restorableRoleAssignments) {
+        $previewLines += Format-AzCommand (Get-RoleAssignmentCreateArguments -Assignment $assignment -PrincipalId $placeholderPrincipalId)
+    }
+
+    foreach ($assignment in $skippedRoleAssignments) {
+        $previewLines += "# Manual RBAC review: $(Get-RoleAssignmentLabel -Assignment $assignment); reason=$(Get-RoleAssignmentRestoreSkipReason -Assignment $assignment)"
+    }
+
+    foreach ($policy in $keyVaultPolicies) {
+        $policyArgs = @(Get-KeyVaultSetPolicyArguments -Policy $policy -PrincipalId $placeholderPrincipalId)
+        if ($policyArgs.Count -gt 0) {
+            $previewLines += Format-AzCommand $policyArgs
+        }
+        else {
+            $vaultLabel = if ($policy.vaultName) { [string]$policy.vaultName } else { '<unknown vault>' }
+            $previewLines += "# Manual Key Vault policy review: $vaultLabel; reason=no replayable permissions were captured"
+        }
+    }
+
+    $commands = @()
+    $commands += New-ActionCommand `
+        -Description 'Restore system-assigned managed identity authorizations.' `
+        -PreviewLines $previewLines `
+        -ScriptBlock {
+            $newPrincipalId = Get-RecreatedSystemAssignedPrincipalId -Vm $vm
+            Write-Info "Recreated system-assigned principal ID: $newPrincipalId"
+
+            foreach ($assignment in $restorableRoleAssignments) {
+                $args = @(Get-RoleAssignmentCreateArguments -Assignment $assignment -PrincipalId $newPrincipalId)
+                if ($args.Count -eq 0) {
+                    continue
+                }
+
+                Invoke-AzText -Arguments $args -Description "Restore RBAC assignment: $(Get-RoleAssignmentLabel -Assignment $assignment)." | Out-Null
+            }
+
+            foreach ($assignment in $skippedRoleAssignments) {
+                Write-WarningLine "Review RBAC assignment manually: $(Get-RoleAssignmentLabel -Assignment $assignment). Reason: $(Get-RoleAssignmentRestoreSkipReason -Assignment $assignment)."
+            }
+
+            foreach ($policy in $keyVaultPolicies) {
+                $args = @(Get-KeyVaultSetPolicyArguments -Policy $policy -PrincipalId $newPrincipalId)
+                if ($args.Count -eq 0) {
+                    $vaultLabel = if ($policy.vaultName) { [string]$policy.vaultName } else { '<unknown vault>' }
+                    Write-WarningLine "Review Key Vault access policy manually for $vaultLabel. No replayable permissions were captured."
+                    continue
+                }
+
+                Invoke-AzText -Arguments $args -Description "Restore Key Vault access policy: $($policy.vaultName)." | Out-Null
+            }
+        }
+
+    return $commands
+}
+
 function Get-PostCreateCommands {
     param($Plan)
 
@@ -4581,6 +5034,7 @@ function Get-PostCreateCommands {
                 '-g', $vm.resourceGroup,
                 '-n', $vm.name
             )
+            $commands += Get-SystemAssignedIdentityAuthorizationRestoreCommands -Plan $Plan
         }
 
         if ($identityType -like '*UserAssigned*' -and $vm.identity.userAssignedIdentities) {
@@ -4668,7 +5122,9 @@ function Show-CommandPreview {
     foreach ($command in $Commands) {
         Write-Host ''
         Write-Host $command.Description -ForegroundColor Green
-        Write-Host (Format-AzCommand $command.Arguments)
+        foreach ($line in @(Get-CommandPreviewLines -Command $command)) {
+            Write-Host $line
+        }
     }
 }
 
@@ -4736,6 +5192,11 @@ function Show-DecisionSummary {
     Write-Host ("VM apps:          Restore {0} VM application(s)" -f @($Plan.source.vm.applicationProfile.galleryApplications).Count)
     Write-Host ("Backup check:     {0} saved result(s); verify protection after conversion" -f @(Get-PlanSourceCollection -Plan $Plan -Name 'backupProtection').Count)
     Write-Host ("Policy review:    {0} assignment(s), {1} exemption(s) saved for review" -f @(Get-PlanSourceCollection -Plan $Plan -Name 'policyAssignments').Count, @(Get-PlanSourceCollection -Plan $Plan -Name 'policyExemptions').Count)
+    if ($Plan.source.vm.identity -and [string]$Plan.source.vm.identity.type -like '*SystemAssigned*') {
+        $roleAssignments = @(Get-PlanSourceCollection -Plan $Plan -Name 'systemAssignedIdentityRoleAssignments')
+        $keyVaultPolicies = @(Get-PlanSourceCollection -Plan $Plan -Name 'systemAssignedIdentityKeyVaultAccessPolicies')
+        Write-Host ("Identity auth:    Replay {0} RBAC assignment(s), {1} Key Vault access polic(ies)" -f @(Get-RestorableRoleAssignments -Assignments $roleAssignments).Count, $keyVaultPolicies.Count)
+    }
     if ($Plan.decisions.PSObject.Properties['reservationSavingsImpact']) {
         $riImpact = $Plan.decisions.reservationSavingsImpact
         Write-Host ("RI savings:       {0}; {1} possible match(es)" -f $riImpact.status, @($riImpact.matches).Count)
@@ -4814,7 +5275,7 @@ function Invoke-Main {
         '-g', $plan.source.vm.resourceGroup,
         '-n', $plan.source.vm.name,
         '-d',
-        '--query', '{powerState:powerState,priority:priority,evictionPolicy:evictionPolicy,vmSize:hardwareProfile.vmSize,availabilitySet:availabilitySet.id,osDisk:storageProfile.osDisk.managedDisk.id,nics:networkProfile.networkInterfaces[].{id:id,primary:primary},tags:tags}',
+        '--query', '{powerState:powerState,priority:priority,evictionPolicy:evictionPolicy,vmSize:hardwareProfile.vmSize,availabilitySet:availabilitySet.id,identity:identity,osDisk:storageProfile.osDisk.managedDisk.id,nics:networkProfile.networkInterfaces[].{id:id,primary:primary},tags:tags}',
         '-o', 'json'
     ) -Description 'Reading recreated VM summary.'
 

@@ -55,10 +55,15 @@ running, stopped, or deallocated.
 Source VM tags are captured in the saved plan and reapplied to the recreated VM.
 SpotSwitcher also tries to preserve compatible marketplace plan, placement,
 diagnostic settings, maintenance assignments, VM Applications, and direct VM
-locks. Backup and VM-scoped Azure Policy artifacts are detected for review.
+locks. Visible system-assigned identity RBAC assignments in the current
+subscription and parent scopes, plus visible legacy Key Vault access policies,
+are captured and replayed to the new principal ID. Backup, VM-scoped Azure
+Policy artifacts, and external identity references are detected for review.
 Reserved VM Instance savings are checked for Spot conversions where the current
 identity can read Azure reservations; matching reservations default to stopping
 unless the user accepts the cost impact.
+VM lookup can search by name prefix; matching VM names are returned as a
+10-at-a-time pick list.
 SKU browsing shows five choices at a time. When the current SKU is valid for the
 target priority/quota, it is listed first as Current SKU, followed by the rest
 of the CPU/RAM-compatible candidates sorted by estimated monthly cost. Custom
